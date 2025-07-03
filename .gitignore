@@ -1,0 +1,4 @@
+.vscode
+*.exe
+bin/implantDLL.dll
+finalShellcode.bin
