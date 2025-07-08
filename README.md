@@ -113,7 +113,7 @@ From "x64 Native Tools Command Prompt for VS 2022":
 
 ## 🧠 Credits
 
-- [TheWover](https://github.com/TheWover) – Donut
+- [TheWover](https://github.com/TheWover) [modexp/odzhan](https://modexp.wordpress.com/) – Donut
 - [fancycode](https://github.com/fancycode) – MemoryModule
 - [passthehashbrowns](https://github.com/passthehashbrowns) – Being-A-Good-CLR-Host
 - ChatGPT – For helping with stack unwinding research
