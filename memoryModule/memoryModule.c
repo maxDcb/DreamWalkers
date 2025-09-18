@@ -857,7 +857,7 @@ int Loader(INSTANCE* inst)
 
             // __debugbreak();
 
-            // TODO Handle exit of the DLL by putting a VEH on the return of the DLL function ?
+            // SpoofDllReturn in test.asm routes the export's return into AfterDllContinuation.
             Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
             
             return 0;
@@ -1714,6 +1714,11 @@ static DWORD HandleExitBehavior(void)
 static DWORD WINAPI AfterExeContinuation(LPVOID parameter)
 {
     (void)parameter;
+    return HandleExitBehavior();
+}
+
+DWORD WINAPI AfterDllContinuation(void)
+{
     return HandleExitBehavior();
 }
 

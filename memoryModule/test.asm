@@ -1,3 +1,5 @@
+EXTERN AfterDllContinuation:PROC
+
 .code
 
 Spoof proc
@@ -6,6 +8,7 @@ Spoof proc
     ; We removed any backup of old context because we don't come back
     ; ---------------------------------------------------------------------
 
+    mov    r12, rsp                    ; Save original stack pointer
     pop    rax                         ; Real return address in rax
 
     mov    rdi, [rsp + 32]             ; Storing struct in the rdi
@@ -100,7 +103,15 @@ Spoof proc
     ; ----------------------------------------------------------------------
 
     mov    r11, rsi                    ; Copying function to call into r11
+
+    lea    rax, SpoofDllReturn
+    push   rax                         ; Redirect return into our continuation stub
+
     jmp    r11
+
+SpoofDllReturn:
+    mov    rsp, r12                    ; Restore original stack pointer
+    jmp    AfterDllContinuation
 
 
 Spoof endp
