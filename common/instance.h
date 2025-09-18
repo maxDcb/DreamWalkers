@@ -56,7 +56,7 @@ typedef struct _INSTANCE
     uint8_t sRtlAddFunctionTable[32];    // stack spoofing
     uint8_t sSleep[32];
     uint8_t sAddVectoredExceptionHandler[32];
-    uint8_t sRemoveVectoredExceptionHandler[32];
+    uint8_t sRemoveVectoredExceptionHandler[64];
     uint8_t sExitThread[32];
     uint8_t sExitProcess[32];
     uint8_t sFlushInstructionCache[32];
