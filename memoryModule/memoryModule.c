@@ -759,11 +759,9 @@ int Loader(INSTANCE* inst)
         // LoaderDotNetFunction _loaderDotNetFunction = (LoaderDotNetFunction)func;
         // _loaderDotNetFunction(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine);
 
-        InstallExitVEH(inst);
-
+        // TODO handle the exit of the managed code in DotnetExe.cpp
         Spoof(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
 
-        HandleExitBehavior();
         return 0;
     }
     //
@@ -818,12 +816,14 @@ int Loader(INSTANCE* inst)
             }
 #endif
 
-            // __debugbreak();
+            // Handle exit of exe using VEH
             InstallExitVEH(inst);
 
+            // __debugbreak();
             Spoof(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
 
             HandleExitBehavior();
+
             return 0;
         }
         //
@@ -856,11 +856,10 @@ int Loader(INSTANCE* inst)
 #endif
 
             // __debugbreak();
-            InstallExitVEH(inst);
 
+            // TODO Handle exit of the DLL by putting a VEH on the return of the DLL function ?
             Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
-
-            HandleExitBehavior();
+            
             return 0;
         }
     }
