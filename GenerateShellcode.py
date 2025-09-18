@@ -37,12 +37,12 @@ def extract_byte_array_from_header(header_path, array_name):
 
 # Define the INSTANCE struct layout in Python
 class Instance:
-    def __init__(self, moduleSize, isDll, sdllMethode, isDotNet, dotnetLoaderSize, dotnetModuleSize, args=""):
+    def __init__(self, moduleSize, isDll, sdllMethode, isDotNet, dotnetLoaderSize, dotnetModuleSize, args="", exit_mode=1):
         # Allocate space for string fields (32 bytes each)
         self.sKernel32DLL = b"kernel32.dll".ljust(32, b"\x00")
         self.sNtDLL = b"ntdll.dll".ljust(32, b"\x00")
         self.wsKernel32DLL = "KERNEL32.DLL".encode("utf-16le").ljust(64, b"\x00")
-        self.sKernelBaseDLL = b"kernelbase.dll".ljust(32, b"\x00")                      # cmd line arguments   
+        self.sKernelBaseDLL = b"kernelbase.dll".ljust(32, b"\x00")                      # cmd line arguments
         self.sMsvcrtDLL = b"msvcrt.dll".ljust(32, b"\x00")
 
         self.sGetProcAddress = b"GetProcAddress".ljust(32, b"\x00")
@@ -65,11 +65,21 @@ class Instance:
         self.sBaseThreadInitThunk = b"BaseThreadInitThunk".ljust(32, b"\x00")
         self.sRtlUserThreadStart = b"RtlUserThreadStart".ljust(32, b"\x00")
         self.sPrintf = b"printf".ljust(32, b"\x00")
-        self.sGetCommandLineA = b"GetCommandLineA".ljust(32, b"\x00") 
-        self.sGetCommandLineW = b"".ljust(32, b"\x00") 
+        self.sGetCommandLineA = b"GetCommandLineA".ljust(32, b"\x00")
+        self.sGetCommandLineW = b"".ljust(32, b"\x00")
         self.sRtlAddFunctionTable = b"RtlAddFunctionTable".ljust(32, b"\x00")
+        self.sSleep = b"Sleep".ljust(32, b"\x00")
+        self.sAddVectoredExceptionHandler = b"AddVectoredExceptionHandler".ljust(32, b"\x00")
+        self.sRemoveVectoredExceptionHandler = b"RemoveVectoredExceptionHandler".ljust(32, b"\x00")
+        self.sExitThread = b"ExitThread".ljust(32, b"\x00")
+        self.sExitProcess = b"ExitProcess".ljust(32, b"\x00")
+        self.sFlushInstructionCache = b"FlushInstructionCache".ljust(32, b"\x00")
+        self.sGetCurrentProcess = b"GetCurrentProcess".ljust(32, b"\x00")
+        self.sRtlExitUserProcess = b"RtlExitUserProcess".ljust(32, b"\x00")
 
-        self.moduleSize = moduleSize 
+        self.moduleSize = moduleSize
+
+        self.exit_mode = exit_mode
 
         self.isModuleStompingUsed = 1
         self.sModuleToStomp = b"Windows.Storage.dll".ljust(32, b"\x00")
@@ -134,8 +144,16 @@ class Instance:
             self.sGetCommandLineA,
             self.sGetCommandLineW,
             self.sRtlAddFunctionTable,
-            # Simulate function pointer struct with nulls (16 ptrs x 8 bytes each if 64-bit)
-            b"\x00" * (23 * 8),
+            self.sSleep,
+            self.sAddVectoredExceptionHandler,
+            self.sRemoveVectoredExceptionHandler,
+            self.sExitThread,
+            self.sExitProcess,
+            self.sFlushInstructionCache,
+            self.sGetCurrentProcess,
+            self.sRtlExitUserProcess,
+            # Simulate function pointer struct with nulls (30 ptrs x 8 bytes each if 64-bit)
+            b"\x00" * (30 * 8),
 
             struct.pack("<I", self.moduleSize),
 
@@ -147,6 +165,7 @@ class Instance:
             self.sMagicBytes,
             self.sDataSec,
             self.sCmdLine,
+            struct.pack("<B", self.exit_mode),
 
             self.sPDataSec,
             self.sGadget,
@@ -166,7 +185,7 @@ class Instance:
         return blob
 
 
-def buildLoaderShellcode(fileName, methodeDll, args):
+def buildLoaderShellcode(fileName, methodeDll, args, exit_mode):
 
     peBinary = read_exe_to_buffer(fileName)
 
@@ -198,7 +217,7 @@ def buildLoaderShellcode(fileName, methodeDll, args):
     dotnetLoaderSize = len(dotnetLoader) if isDotNet else 0
     dotnetModuleSize = len(peBinary) if isDotNet else 0
 
-    inst = Instance(moduleSize, isDll, sdllMethode, isDotNet, dotnetLoaderSize, dotnetModuleSize, args)
+    inst = Instance(moduleSize, isDll, sdllMethode, isDotNet, dotnetLoaderSize, dotnetModuleSize, args, exit_mode)
     blob = inst.pack()
 
     # Compute the required padding length
@@ -333,10 +352,12 @@ def main():
     parser.add_argument("-f", "--file", required=True, help="PE file path (DLL or EXE)")
     parser.add_argument("-m", "--method", default="", help="Method name to invoke in case of DLL")
     parser.add_argument("-c", "--cmd", default="", help="Command line arguments")
+    parser.add_argument("-x", "--exit", type=int, choices=[1, 2, 3], default=1,
+                        help="Exit behavior: 1=exit thread, 2=exit process, 3=block indefinitely")
 
     args = parser.parse_args()
 
-    buildLoaderShellcode(args.file, args.method, args.cmd)
+    buildLoaderShellcode(args.file, args.method, args.cmd, args.exit)
 
 
 if __name__ == "__main__":

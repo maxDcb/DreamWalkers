@@ -85,7 +85,8 @@ typedef struct {
     BOOL initialized;
     BOOL isDLL;
     BOOL isRelocated;
-		
+    INSTANCE* inst;
+
     struct ExportNameEntry *nameExportsTable;
     ExeEntryProc exeEntry;
     DWORD pageSize;
@@ -157,6 +158,65 @@ static inline void* MM_GetCommandLineA(INSTANCE* inst)
     void* ptr = inst->api.GetCommandLineA();
     return ptr;
 }
+
+
+static inline HANDLE MM_GetCurrentProcess(INSTANCE* inst)
+{
+    if (!inst || !inst->api.GetCurrentProcess)
+        return NULL;
+    return inst->api.GetCurrentProcess();
+}
+
+
+static inline BOOL MM_FlushInstructionCache(INSTANCE* inst, HANDLE process, LPCVOID baseAddress, SIZE_T size)
+{
+    if (!inst || !inst->api.FlushInstructionCache)
+        return FALSE;
+    return inst->api.FlushInstructionCache(process, baseAddress, size);
+}
+
+
+static inline PVOID MM_AddVectoredExceptionHandler(INSTANCE* inst, ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+{
+    if (!inst || !inst->api.AddVectoredExceptionHandler)
+        return NULL;
+    return inst->api.AddVectoredExceptionHandler(first, handler);
+}
+
+
+static inline ULONG MM_RemoveVectoredExceptionHandler(INSTANCE* inst, PVOID handle)
+{
+    if (!inst || !inst->api.RemoveVectoredExceptionHandler)
+        return 0;
+    return inst->api.RemoveVectoredExceptionHandler(handle);
+}
+
+
+static inline VOID MM_ExitThread(INSTANCE* inst, DWORD exitCode)
+{
+    if (inst && inst->api.ExitThread)
+        inst->api.ExitThread(exitCode);
+}
+
+
+static inline VOID MM_ExitProcess(INSTANCE* inst, UINT exitCode)
+{
+    if (inst && inst->api.ExitProcess)
+        inst->api.ExitProcess(exitCode);
+}
+
+
+static inline VOID MM_Sleep(INSTANCE* inst, DWORD milliseconds)
+{
+    if (inst && inst->api.Sleep)
+        inst->api.Sleep(milliseconds);
+}
+
+
+static BOOL InstallExitVEH(INSTANCE* inst);
+static void RemoveExitVEH(INSTANCE* inst);
+static DWORD HandleExitBehavior(void);
+static DWORD WINAPI AfterExeContinuation(LPVOID parameter);
 
 
 //
@@ -563,6 +623,13 @@ int Loader(INSTANCE* inst)
     inst->api.VirtualProtect = (VirtualProtect_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sVirtualProtect);
     inst->api.GetCommandLineA = (GetCommandLineA_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCommandLineA);
     inst->api.RtlAddFunctionTable = (RtlAddFunctionTable_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRtlAddFunctionTable);
+    inst->api.Sleep = (Sleep_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sSleep);
+    inst->api.AddVectoredExceptionHandler = (AddVectoredExceptionHandler_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sAddVectoredExceptionHandler);
+    inst->api.RemoveVectoredExceptionHandler = (RemoveVectoredExceptionHandler_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRemoveVectoredExceptionHandler);
+    inst->api.ExitThread = (ExitThread_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitThread);
+    inst->api.ExitProcess = (ExitProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitProcess);
+    inst->api.FlushInstructionCache = (FlushInstructionCache_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sFlushInstructionCache);
+    inst->api.GetCurrentProcess = (GetCurrentProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCurrentProcess);
 	
     // For shellcode debug only
     // HMODULE msvcrt = inst->api.LoadLibraryA(inst->sMsvcrtDLL);
@@ -653,8 +720,12 @@ int Loader(INSTANCE* inst)
         // LoaderDotNetFunction _loaderDotNetFunction = (LoaderDotNetFunction)func;
         // _loaderDotNetFunction(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine);
 
+        InstallExitVEH(inst);
+
         Spoof(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
-        
+
+        HandleExitBehavior();
+        return 0;
     }
     //
     // Unmanaged code
@@ -709,7 +780,12 @@ int Loader(INSTANCE* inst)
 #endif
 
             // __debugbreak();
+            InstallExitVEH(inst);
+
             Spoof(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
+
+            HandleExitBehavior();
+            return 0;
         }
         //
         // DLL
@@ -741,11 +817,16 @@ int Loader(INSTANCE* inst)
 #endif
 
             // __debugbreak();
+            InstallExitVEH(inst);
+
             Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
+
+            HandleExitBehavior();
+            return 0;
         }
     }
 
-	return 0;
+        return 0;
 }
 
 
@@ -1288,6 +1369,7 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
         return NULL;
 
     result->codeBase = code;
+    result->inst = inst;
     result->isDLL = (old_header->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
     result->pageSize = 0x1000;
 
@@ -1385,16 +1467,183 @@ static int _find(const void *a, const void *b)
 }
 
 
+#ifdef _M_X64
+#define IP Rip
+#else
+#define IP Eip
+#endif
+
+static INSTANCE* gExitInstance = NULL;
+static PVOID gVehHandle = NULL;
+static BYTE gOrigK32Byte = 0;
+static BYTE gOrigNtdllByte = 0;
+static LPBYTE gK32ExitProcess = NULL;
+static LPBYTE gNtdllExitUserProc = NULL;
+
+static BOOL PutInt3(INSTANCE* inst, LPBYTE target, BYTE* saved)
+{
+    if (!inst || !target || !saved)
+        return FALSE;
+
+    DWORD oldProtect = 0;
+    if (!MM_VirtualProtect(inst, target, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return FALSE;
+
+    *saved = *target;
+    *target = 0xCC;
+
+    HANDLE process = MM_GetCurrentProcess(inst);
+    if (process)
+        MM_FlushInstructionCache(inst, process, target, 1);
+
+    MM_VirtualProtect(inst, target, 1, oldProtect, &oldProtect);
+    return TRUE;
+}
+
+static void RestoreByte(INSTANCE* inst, LPBYTE target, BYTE saved)
+{
+    if (!inst || !target)
+        return;
+
+    DWORD oldProtect = 0;
+    if (!MM_VirtualProtect(inst, target, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return;
+
+    *target = saved;
+
+    HANDLE process = MM_GetCurrentProcess(inst);
+    if (process)
+        MM_FlushInstructionCache(inst, process, target, 1);
+
+    MM_VirtualProtect(inst, target, 1, oldProtect, &oldProtect);
+}
+
+static LONG CALLBACK VehExitTrap(PEXCEPTION_POINTERS p)
+{
+    if (!p || p->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    void* addr = p->ExceptionRecord->ExceptionAddress;
+    if (addr == gK32ExitProcess || addr == gNtdllExitUserProc) {
+        p->ContextRecord->IP = (DWORD_PTR)AfterExeContinuation;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static BOOL InstallExitVEH(INSTANCE* inst)
+{
+    if (!inst)
+        return FALSE;
+
+    gExitInstance = inst;
+
+    if (gVehHandle)
+        return TRUE;
+
+    if (!inst->api.VirtualProtect || !inst->api.AddVectoredExceptionHandler ||
+        !inst->api.RemoveVectoredExceptionHandler || !inst->api.ExitThread ||
+        !inst->api.ExitProcess || !inst->api.FlushInstructionCache ||
+        !inst->api.GetCurrentProcess)
+        return FALSE;
+
+    HMODULE k32 = MM_GetModuleHandleA(inst, (char*)inst->sKernel32DLL);
+    HMODULE ntd = MM_GetModuleHandleA(inst, (char*)inst->sNtDLL);
+    if (!k32 || !ntd)
+        return FALSE;
+
+    gK32ExitProcess = (LPBYTE)MM_GetProcAddress(inst, k32, (char*)inst->sExitProcess);
+    gNtdllExitUserProc = (LPBYTE)MM_GetProcAddress(inst, ntd, (char*)inst->sRtlExitUserProcess);
+    if (!gK32ExitProcess || !gNtdllExitUserProc)
+        return FALSE;
+
+    if (!PutInt3(inst, gK32ExitProcess, &gOrigK32Byte))
+        return FALSE;
+    if (!PutInt3(inst, gNtdllExitUserProc, &gOrigNtdllByte)) {
+        RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
+        return FALSE;
+    }
+
+    gVehHandle = MM_AddVectoredExceptionHandler(inst, 1, VehExitTrap);
+    if (!gVehHandle) {
+        RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
+        RestoreByte(inst, gNtdllExitUserProc, gOrigNtdllByte);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void RemoveExitVEH(INSTANCE* inst)
+{
+    if (!inst)
+        inst = gExitInstance;
+
+    if (!inst)
+        return;
+
+    if (gVehHandle) {
+        MM_RemoveVectoredExceptionHandler(inst, gVehHandle);
+        gVehHandle = NULL;
+    }
+
+    RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
+    RestoreByte(inst, gNtdllExitUserProc, gOrigNtdllByte);
+
+    gK32ExitProcess = NULL;
+    gNtdllExitUserProc = NULL;
+}
+
+static DWORD HandleExitBehavior(void)
+{
+    INSTANCE* inst = gExitInstance;
+    if (!inst)
+        return 0;
+
+    BYTE mode = inst->exitMode;
+    if (mode != 2 && mode != 3)
+        mode = 1;
+
+    if (mode == 3) {
+        for (;;) {
+            MM_Sleep(inst, 1000);
+        }
+    }
+
+    RemoveExitVEH(inst);
+
+    if (mode == 2) {
+        MM_ExitProcess(inst, 0);
+    } else {
+        MM_ExitThread(inst, 0);
+    }
+
+    return 0;
+}
+
+static DWORD WINAPI AfterExeContinuation(LPVOID parameter)
+{
+    (void)parameter;
+    return HandleExitBehavior();
+}
+
 static inline int MemoryCallEntryPoint(HMEMORYMODULE mod)
 {
     PMEMORYMODULE module = (PMEMORYMODULE)mod;
-	
-    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated) 
+
+    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated || !module->inst)
     {
         return -1;
     }
 
-    return module->exeEntry();
+    if (!InstallExitVEH(module->inst))
+        return -2;
+
+    module->exeEntry();
+
+    HandleExitBehavior();
+    return 0;
 }
 
 
