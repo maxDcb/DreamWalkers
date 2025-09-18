@@ -1696,6 +1696,7 @@ static DWORD HandleExitBehavior(void)
     printf("mode %u\n", mode);
 #endif
 
+    // TODO sleep is not stealth , find a way, maybe call spoof again ?
     if (mode == 3) {
         for (;;) {
             MM_Sleep(inst, 1000);
