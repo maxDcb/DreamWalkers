@@ -91,21 +91,16 @@ Spoof proc
     mov    [rsp], r11
 
     ; ----------------------------------------------------------------------
-    ; Gadget frame
-    ; ----------------------------------------------------------------------
-    
-    sub    rsp, [rdi + 48]
-    mov    r11, [rdi + 80]
-    mov    [rsp], r11
-
-    ; ----------------------------------------------------------------------
     ; We don't intend to come back to this code so we don't fix anything
     ; ----------------------------------------------------------------------
 
     mov    r11, rsi                    ; Copying function to call into r11
 
-    lea    rax, SpoofDllReturn
-    push   rax                         ; Redirect return into our continuation stub
+    mov    [rdi + 8], r12              ; Real return address is now moved into the "OG_retaddr" member
+    mov    [rdi + 16], rbx             ; original rbx is stored into "rbx" member
+    lea    rbx, [SpoofDllReturn]                ; Fixup address is moved into rbx
+    mov    [rdi], rbx                  ; Fixup member now holds the address of Fixup
+    mov    rbx, rdi                    ; Address of param struct (Fixup) is moved into rbx
 
     jmp    r11
 
