@@ -167,6 +167,9 @@ class Instance:
             self.sCmdLine,
             struct.pack("<B", self.exit_mode),
 
+            b"\x00" * (4 * 8),  # EXIT_VEH_CONTEXT pointer fields (64-bit)
+            b"\x00" * 4,        # EXIT_VEH_CONTEXT byte fields
+
             self.sPDataSec,
             self.sGadget,
 

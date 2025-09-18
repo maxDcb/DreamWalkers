@@ -40,6 +40,7 @@
 #include <winnt.h>
 #include <stddef.h>
 #include <tchar.h>
+#include <intrin.h>
 
 
 #ifdef DEBUG_OUTPUT
@@ -199,6 +200,29 @@ static inline ULONG MM_RemoveVectoredExceptionHandler(INSTANCE* inst, PVOID hand
     return inst->api.RemoveVectoredExceptionHandler(handle);
 }
 
+
+static __forceinline PVOID MmReadArbitraryUserPointer(void)
+{
+#ifdef _WIN64
+    return (PVOID)__readgsqword(0x28);
+#else
+    return (PVOID)__readfsdword(0x14);
+#endif
+}
+
+static __forceinline void MmWriteArbitraryUserPointer(PVOID value)
+{
+#ifdef _WIN64
+    __writegsqword(0x28, (unsigned __int64)(ULONG_PTR)value);
+#else
+    __writefsdword(0x14, (unsigned long)(ULONG_PTR)value);
+#endif
+}
+
+static __forceinline INSTANCE* MmGetThreadInstance(void)
+{
+    return (INSTANCE*)MmReadArbitraryUserPointer();
+}
 
 static inline VOID MM_ExitThread(INSTANCE* inst, DWORD exitCode)
 {
@@ -1488,13 +1512,6 @@ static int _find(const void *a, const void *b)
 #define IP Eip
 #endif
 
-static INSTANCE* gExitInstance = NULL;
-static PVOID gVehHandle = NULL;
-static BYTE gOrigK32Byte = 0;
-static BYTE gOrigNtdllByte = 0;
-static LPBYTE gK32ExitProcess = NULL;
-static LPBYTE gNtdllExitUserProc = NULL;
-
 static BOOL PutInt3(INSTANCE* inst, LPBYTE target, BYTE* saved)
 {
     if (!inst || !target || !saved)
@@ -1538,8 +1555,13 @@ static LONG CALLBACK VehExitTrap(PEXCEPTION_POINTERS p)
     if (!p || p->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
         return EXCEPTION_CONTINUE_SEARCH;
 
+    INSTANCE* inst = MmGetThreadInstance();
+    if (!inst)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
     void* addr = p->ExceptionRecord->ExceptionAddress;
-    if (addr == gK32ExitProcess || addr == gNtdllExitUserProc) {
+    if (addr == ctx->k32ExitProcess || addr == ctx->ntdllExitUserProcess) {
         p->ContextRecord->IP = (DWORD_PTR)AfterExeContinuation;
 
 #ifdef DEBUG_OUTPUT
@@ -1552,6 +1574,7 @@ static LONG CALLBACK VehExitTrap(PEXCEPTION_POINTERS p)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+
 static BOOL InstallExitVEH(INSTANCE* inst)
 {
 #ifdef DEBUG_OUTPUT
@@ -1561,9 +1584,9 @@ static BOOL InstallExitVEH(INSTANCE* inst)
     if (!inst)
         return FALSE;
 
-    gExitInstance = inst;
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
 
-    if (gVehHandle)
+    if (ctx->vehHandle)
         return TRUE;
 
     if (!inst->api.VirtualProtect || !inst->api.AddVectoredExceptionHandler ||
@@ -1572,57 +1595,82 @@ static BOOL InstallExitVEH(INSTANCE* inst)
         !inst->api.GetCurrentProcess)
         return FALSE;
 
+    ctx->previousArbitraryUserPointer = MmReadArbitraryUserPointer();
+    ctx->hasPreviousArbitraryUserPointer = 1;
+    MmWriteArbitraryUserPointer(inst);
+
     HMODULE k32 = MM_GetModuleHandleA(inst, (char*)inst->sKernel32DLL);
     HMODULE ntd = MM_GetModuleHandleA(inst, (char*)inst->sNtDLL);
     if (!k32 || !ntd)
-        return FALSE;
+        goto Failure;
 
-    gK32ExitProcess = (LPBYTE)MM_GetProcAddress(inst, k32, (char*)inst->sExitProcess);
-    gNtdllExitUserProc = (LPBYTE)MM_GetProcAddress(inst, ntd, (char*)inst->sRtlExitUserProcess);
-    if (!gK32ExitProcess || !gNtdllExitUserProc)
-        return FALSE;
+    ctx->k32ExitProcess = (LPBYTE)MM_GetProcAddress(inst, k32, (char*)inst->sExitProcess);
+    ctx->ntdllExitUserProcess = (LPBYTE)MM_GetProcAddress(inst, ntd, (char*)inst->sRtlExitUserProcess);
+    if (!ctx->k32ExitProcess || !ctx->ntdllExitUserProcess)
+        goto Failure;
 
-    if (!PutInt3(inst, gK32ExitProcess, &gOrigK32Byte))
-        return FALSE;
-    if (!PutInt3(inst, gNtdllExitUserProc, &gOrigNtdllByte)) 
+    if (!PutInt3(inst, ctx->k32ExitProcess, &ctx->savedK32Byte))
+        goto Failure;
+    if (!PutInt3(inst, ctx->ntdllExitUserProcess, &ctx->savedNtdllByte))
     {
-        RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
-        return FALSE;
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        goto Failure;
     }
 
-    gVehHandle = MM_AddVectoredExceptionHandler(inst, 1, VehExitTrap);
+    ctx->vehHandle = MM_AddVectoredExceptionHandler(inst, 1, VehExitTrap);
 
-    if (!gVehHandle) 
+    if (!ctx->vehHandle)
     {
-        RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
-        RestoreByte(inst, gNtdllExitUserProc, gOrigNtdllByte);
-        return FALSE;
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        RestoreByte(inst, ctx->ntdllExitUserProcess, ctx->savedNtdllByte);
+        goto Failure;
     }
 
 #ifdef DEBUG_OUTPUT
     printf("InstallExitVEH OK\n");
 #endif
     return TRUE;
+
+Failure:
+    if (ctx->hasPreviousArbitraryUserPointer)
+    {
+        MmWriteArbitraryUserPointer(ctx->previousArbitraryUserPointer);
+        ctx->previousArbitraryUserPointer = NULL;
+        ctx->hasPreviousArbitraryUserPointer = 0;
+    }
+    ctx->k32ExitProcess = NULL;
+    ctx->ntdllExitUserProcess = NULL;
+    ctx->vehHandle = NULL;
+    return FALSE;
 }
 
 static void RemoveExitVEH(INSTANCE* inst)
 {
     if (!inst)
-        inst = gExitInstance;
-
-    if (!inst)
         return;
 
-    if (gVehHandle) {
-        MM_RemoveVectoredExceptionHandler(inst, gVehHandle);
-        gVehHandle = NULL;
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
+
+    if (ctx->vehHandle) {
+        MM_RemoveVectoredExceptionHandler(inst, ctx->vehHandle);
+        ctx->vehHandle = NULL;
     }
 
-    RestoreByte(inst, gK32ExitProcess, gOrigK32Byte);
-    RestoreByte(inst, gNtdllExitUserProc, gOrigNtdllByte);
+    if (ctx->k32ExitProcess) {
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        ctx->k32ExitProcess = NULL;
+    }
 
-    gK32ExitProcess = NULL;
-    gNtdllExitUserProc = NULL;
+    if (ctx->ntdllExitUserProcess) {
+        RestoreByte(inst, ctx->ntdllExitUserProcess, ctx->savedNtdllByte);
+        ctx->ntdllExitUserProcess = NULL;
+    }
+
+    if (ctx->hasPreviousArbitraryUserPointer) {
+        MmWriteArbitraryUserPointer(ctx->previousArbitraryUserPointer);
+        ctx->previousArbitraryUserPointer = NULL;
+        ctx->hasPreviousArbitraryUserPointer = 0;
+    }
 }
 
 static DWORD HandleExitBehavior(void)
@@ -1630,8 +1678,8 @@ static DWORD HandleExitBehavior(void)
 #ifdef DEBUG_OUTPUT
         printf("HandleExitBehavior\n");
 #endif
-    
-    INSTANCE* inst = gExitInstance;
+
+    INSTANCE* inst = MmGetThreadInstance();
     if (!inst)
         return 0;
 

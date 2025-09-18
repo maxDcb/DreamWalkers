@@ -20,6 +20,19 @@
 #include "winapi.h"
 
 #pragma pack(push, 1)
+
+typedef struct _EXIT_VEH_CONTEXT
+{
+    void*  vehHandle;
+    LPBYTE k32ExitProcess;
+    LPBYTE ntdllExitUserProcess;
+    void*  previousArbitraryUserPointer;
+    uint8_t savedK32Byte;
+    uint8_t savedNtdllByte;
+    uint8_t hasPreviousArbitraryUserPointer;
+    uint8_t reserved;
+} EXIT_VEH_CONTEXT;
+
 typedef struct _INSTANCE
 {
     uint32_t lenTest;
@@ -111,6 +124,8 @@ typedef struct _INSTANCE
     uint8_t sDataSec[8];            // cmdline
     uint8_t sCmdLine[2048];         // cmdline
     uint8_t exitMode;
+
+    EXIT_VEH_CONTEXT exitVehContext;
 
     uint8_t sPDataSec[8];           // stack spoofing
     uint8_t sGadget[8];             // stack spoofing
