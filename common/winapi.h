@@ -201,6 +201,24 @@ typedef FARPROC(WINAPI* GetProcAddress_t)(
     HMODULE               hModule,
     LPCSTR                lpProcName);
 
+typedef VOID (WINAPI* ExitThread_t)(
+    DWORD                 dwExitCode);
+
+typedef VOID (WINAPI* ExitProcess_t)(
+    UINT                  uExitCode);
+
+typedef BOOL (WINAPI* FlushInstructionCache_t)(
+    HANDLE                hProcess,
+    LPCVOID               lpBaseAddress,
+    SIZE_T                dwSize);
+
+typedef PVOID (WINAPI* AddVectoredExceptionHandler_t)(
+    ULONG                       First,
+    PVECTORED_EXCEPTION_HANDLER Handler);
+
+typedef ULONG (WINAPI* RemoveVectoredExceptionHandler_t)(
+    PVOID                       Handle);
+
 typedef PRUNTIME_FUNCTION(WINAPI* RtlLookupFunctionEntry_t)(
     DWORD64               ControlPc,
     PDWORD64              ImageBase,

@@ -20,99 +20,128 @@
 #include "winapi.h"
 
 #pragma pack(push, 1)
-typedef struct _INSTANCE 
-{		
-	uint32_t    lenTest;  
-	
-	// Could be encrypted to avoid detection
-	uint8_t sKernel32DLL[32];
-	uint8_t sNtDLL[32];
-	uint16_t wsKernel32DLL[32];
-	uint8_t sKernelBaseDLL[32];  	 // cmdline
-	uint8_t sMsvcrtDLL[32];  		 // printf
-	
-	uint8_t sGetProcAddress[32];
-	uint8_t sGetModuleHandleA[32];
-	uint8_t sLoadLibraryA[32];
-	uint8_t sFreeLibrary[32];
-	uint8_t sVirtualAlloc[32];
-	uint8_t sVirtualFree[32];
-	uint8_t sVirtualProtect[32];
-	uint8_t sHeapAlloc[32];
-	uint8_t sHeapFree[32];
-	uint8_t sGetProcessHeap[32];
-	uint8_t sGetLastError[32];
-	uint8_t sGetNativeSystemInfo[32];
-	uint8_t sIsBadReadPtr[32];
-	uint8_t sHeapReAlloc[32];
-	uint8_t sWaitForSingleObject[32];
-	uint8_t sCreateThread[32];
-	uint8_t sRtlLookupFunctionEntry[32];// stack spoofing
-	uint8_t sBaseThreadInitThunk[32];	// stack spoofing
-	uint8_t sRtlUserThreadStart[32];	// stack spoofing
-	uint8_t sPrintf[32];				// printf
-	uint8_t sGetCommandLineA[32];		// cmdline
-	uint8_t sGetCommandLineW[32];		// cmdline
-	uint8_t sRtlAddFunctionTable[32];	// stack spoofing
-	
-    struct 
+
+typedef struct _EXIT_VEH_CONTEXT
+{
+    void*  vehHandle;
+    LPBYTE k32ExitProcess;
+    LPBYTE ntdllExitUserProcess;
+    void*  previousArbitraryUserPointer;
+    uint8_t savedK32Byte;
+    uint8_t savedNtdllByte;
+    uint8_t hasPreviousArbitraryUserPointer;
+    uint8_t reserved;
+} EXIT_VEH_CONTEXT;
+
+typedef struct _INSTANCE
+{
+    uint32_t lenTest;
+
+    // Could be encrypted to avoid detection
+    uint8_t sKernel32DLL[32];
+    uint8_t sNtDLL[32];
+    uint16_t wsKernel32DLL[32];
+    uint8_t sKernelBaseDLL[32];      // cmdline
+    uint8_t sMsvcrtDLL[32];          // printf
+
+    uint8_t sGetProcAddress[32];
+    uint8_t sGetModuleHandleA[32];
+    uint8_t sLoadLibraryA[32];
+    uint8_t sFreeLibrary[32];
+    uint8_t sVirtualAlloc[32];
+    uint8_t sVirtualFree[32];
+    uint8_t sVirtualProtect[32];
+    uint8_t sHeapAlloc[32];
+    uint8_t sHeapFree[32];
+    uint8_t sGetProcessHeap[32];
+    uint8_t sGetLastError[32];
+    uint8_t sGetNativeSystemInfo[32];
+    uint8_t sIsBadReadPtr[32];
+    uint8_t sHeapReAlloc[32];
+    uint8_t sWaitForSingleObject[32];
+    uint8_t sCreateThread[32];
+    uint8_t sRtlLookupFunctionEntry[32]; // stack spoofing
+    uint8_t sBaseThreadInitThunk[32];    // stack spoofing
+    uint8_t sRtlUserThreadStart[32];     // stack spoofing
+    uint8_t sPrintf[32];                 // printf
+    uint8_t sGetCommandLineA[32];        // cmdline
+    uint8_t sGetCommandLineW[32];        // cmdline
+    uint8_t sRtlAddFunctionTable[32];    // stack spoofing
+    uint8_t sSleep[32];
+    uint8_t sAddVectoredExceptionHandler[32];
+    uint8_t sRemoveVectoredExceptionHandler[64];
+    uint8_t sExitThread[32];
+    uint8_t sExitProcess[32];
+    uint8_t sFlushInstructionCache[32];
+    uint8_t sGetCurrentProcess[32];
+    uint8_t sRtlExitUserProcess[32];
+
+    struct
     {
-        LoadLibraryA_t                   LoadLibraryA;
-		FreeLibrary_t					 FreeLibrary;
-        GetProcAddress_t                 GetProcAddress;
-        GetModuleHandleA_t               GetModuleHandleA;
-        VirtualAlloc_t                   VirtualAlloc;
-        VirtualFree_t                    VirtualFree;
-        VirtualProtect_t                 VirtualProtect;
-		WaitForSingleObject_t            WaitForSingleObject;
-		CreateThread_t                   CreateThread;
-		GetCommandLineA_t             	 GetCommandLineA;				// cmdline
-		GetCommandLineW_t              	 GetCommandLineW;				// cmdline
-        HeapAlloc_t                      HeapAlloc;
-        HeapReAlloc_t                    HeapReAlloc;
-        GetProcessHeap_t                 GetProcessHeap;
-        HeapFree_t                       HeapFree;
-        GetLastError_t                   GetLastError;
-		GetNativeSystemInfo_t			 GetNativeSystemInfo;
-		IsBadReadPtr_t 					 IsBadReadPtr;
-		RtlLookupFunctionEntry_t		 RtlLookupFunctionEntry;		// stack spoofing
-		BaseThreadInitThunk_t		 	 BaseThreadInitThunk;			// stack spoofing
-		RtlUserThreadStart_t			 RtlUserThreadStart;			// stack spoofing
-		printf_t 					 	 Printf;						// printf
-		RtlAddFunctionTable_t			 RtlAddFunctionTable;			// stack spoofing
+        LoadLibraryA_t                LoadLibraryA;
+        FreeLibrary_t                 FreeLibrary;
+        GetProcAddress_t              GetProcAddress;
+        GetModuleHandleA_t            GetModuleHandleA;
+        VirtualAlloc_t                VirtualAlloc;
+        VirtualFree_t                 VirtualFree;
+        VirtualProtect_t              VirtualProtect;
+        WaitForSingleObject_t         WaitForSingleObject;
+        CreateThread_t                CreateThread;
+        GetCommandLineA_t             GetCommandLineA;     // cmdline
+        GetCommandLineW_t             GetCommandLineW;     // cmdline
+        HeapAlloc_t                   HeapAlloc;
+        HeapReAlloc_t                 HeapReAlloc;
+        GetProcessHeap_t              GetProcessHeap;
+        HeapFree_t                    HeapFree;
+        GetLastError_t                GetLastError;
+        GetNativeSystemInfo_t         GetNativeSystemInfo;
+        IsBadReadPtr_t                IsBadReadPtr;
+        RtlLookupFunctionEntry_t      RtlLookupFunctionEntry; // stack spoofing
+        BaseThreadInitThunk_t         BaseThreadInitThunk;    // stack spoofing
+        RtlUserThreadStart_t          RtlUserThreadStart;     // stack spoofing
+        printf_t                      Printf;                 // printf
+        RtlAddFunctionTable_t         RtlAddFunctionTable;    // stack spoofing
+        Sleep_t                       Sleep;
+        AddVectoredExceptionHandler_t AddVectoredExceptionHandler;
+        RemoveVectoredExceptionHandler_t RemoveVectoredExceptionHandler;
+        ExitThread_t                  ExitThread;
+        ExitProcess_t                 ExitProcess;
+        FlushInstructionCache_t       FlushInstructionCache;
+        GetCurrentProcess_t           GetCurrentProcess;
     } api;
 
+    uint32_t moduleSize;
 
-	uint32_t moduleSize;
+    // option for module stomping
+    uint8_t isModuleStompingUsed;
+    uint8_t sModuleToStomp[32];
 
-	// option for module stomping
-	uint8_t isModuleStompingUsed;
-	uint8_t sModuleToStomp[32];
+    // find the module that follow the loader
+    uint32_t instanceSize;
+    uint32_t loaderSize;
+    uint8_t sMagicBytes[8];
 
-	// find the module that follow the loader
-	uint32_t instanceSize;  
-	uint32_t loaderSize;
-	uint8_t sMagicBytes[8];
+    uint8_t sDataSec[8];            // cmdline
+    uint8_t sCmdLine[2048];         // cmdline
+    uint8_t exitMode;
 
-	uint8_t sDataSec[8];		// cmdline
-	uint8_t sCmdLine[2048];		// cmdline
+    EXIT_VEH_CONTEXT exitVehContext;
 
-	uint8_t sPDataSec[8];		// stack spoofing
-	uint8_t sGadget[8];			// stack spoofing
+    uint8_t sPDataSec[8];           // stack spoofing
+    uint8_t sGadget[8];             // stack spoofing
 
-	uint8_t isDll;
-	uint8_t sdllMethode[256];
+    uint8_t isDll;
+    uint8_t sdllMethode[256];
 
-	uint8_t isDotNet;
-	uint32_t dotnetLoaderSize;
-	uint32_t dotnetModuleSize;
+    uint8_t isDotNet;
+    uint32_t dotnetLoaderSize;
+    uint32_t dotnetModuleSize;
 
-	uint8_t sDebug[32];			// debug string
+    uint8_t sDebug[32];             // debug string
 
-	void* ptrModuleTst;			// LoaderTest
-	void* ptrDotNetModuleTst;	// LoaderTest
+    void* ptrModuleTst;             // LoaderTest
+    void* ptrDotNetModuleTst;       // LoaderTest
 
-	
 } INSTANCE;
 #pragma pack(pop)
 

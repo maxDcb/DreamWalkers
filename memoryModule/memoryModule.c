@@ -40,6 +40,7 @@
 #include <winnt.h>
 #include <stddef.h>
 #include <tchar.h>
+#include <intrin.h>
 
 
 #ifdef DEBUG_OUTPUT
@@ -85,7 +86,8 @@ typedef struct {
     BOOL initialized;
     BOOL isDLL;
     BOOL isRelocated;
-		
+    INSTANCE* inst;
+
     struct ExportNameEntry *nameExportsTable;
     ExeEntryProc exeEntry;
     DWORD pageSize;
@@ -157,6 +159,96 @@ static inline void* MM_GetCommandLineA(INSTANCE* inst)
     void* ptr = inst->api.GetCommandLineA();
     return ptr;
 }
+
+
+static inline HANDLE MM_GetCurrentProcess(INSTANCE* inst)
+{
+    if (!inst || !inst->api.GetCurrentProcess)
+        return NULL;
+    return inst->api.GetCurrentProcess();
+}
+
+
+static inline BOOL MM_FlushInstructionCache(INSTANCE* inst, HANDLE process, LPCVOID baseAddress, SIZE_T size)
+{
+    if (!inst || !inst->api.FlushInstructionCache)
+        return FALSE;
+    return inst->api.FlushInstructionCache(process, baseAddress, size);
+}
+
+
+static inline PVOID MM_AddVectoredExceptionHandler(INSTANCE* inst, ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+{
+    if (!inst || !inst->api.AddVectoredExceptionHandler)
+        return NULL;
+
+        #ifdef DEBUG_OUTPUT
+printf("AddVectoredExceptionHandler\n");
+#endif
+
+
+    return inst->api.AddVectoredExceptionHandler(first, handler);
+
+    
+}
+
+
+static inline ULONG MM_RemoveVectoredExceptionHandler(INSTANCE* inst, PVOID handle)
+{
+    if (!inst || !inst->api.RemoveVectoredExceptionHandler)
+        return 0;
+    return inst->api.RemoveVectoredExceptionHandler(handle);
+}
+
+
+static __forceinline PVOID MmReadArbitraryUserPointer(void)
+{
+#ifdef _WIN64
+    return (PVOID)__readgsqword(0x28);
+#else
+    return (PVOID)__readfsdword(0x14);
+#endif
+}
+
+static __forceinline void MmWriteArbitraryUserPointer(PVOID value)
+{
+#ifdef _WIN64
+    __writegsqword(0x28, (unsigned __int64)(ULONG_PTR)value);
+#else
+    __writefsdword(0x14, (unsigned long)(ULONG_PTR)value);
+#endif
+}
+
+static __forceinline INSTANCE* MmGetThreadInstance(void)
+{
+    return (INSTANCE*)MmReadArbitraryUserPointer();
+}
+
+static inline VOID MM_ExitThread(INSTANCE* inst, DWORD exitCode)
+{
+    if (inst && inst->api.ExitThread)
+        inst->api.ExitThread(exitCode);
+}
+
+
+static inline VOID MM_ExitProcess(INSTANCE* inst, UINT exitCode)
+{
+    if (inst && inst->api.ExitProcess)
+        inst->api.ExitProcess(exitCode);
+}
+
+
+static inline VOID MM_Sleep(INSTANCE* inst, DWORD milliseconds)
+{
+    if (inst && inst->api.Sleep)
+        inst->api.Sleep(milliseconds);
+}
+
+
+static BOOL InstallExitVEH(INSTANCE* inst);
+static void RemoveExitVEH(INSTANCE* inst);
+static DWORD HandleExitBehavior(void);
+static DWORD WINAPI AfterExeContinuation(LPVOID parameter);
 
 
 //
@@ -563,6 +655,15 @@ int Loader(INSTANCE* inst)
     inst->api.VirtualProtect = (VirtualProtect_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sVirtualProtect);
     inst->api.GetCommandLineA = (GetCommandLineA_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCommandLineA);
     inst->api.RtlAddFunctionTable = (RtlAddFunctionTable_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRtlAddFunctionTable);
+    inst->api.Sleep = (Sleep_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sSleep);
+
+
+    inst->api.AddVectoredExceptionHandler = (AddVectoredExceptionHandler_t)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sAddVectoredExceptionHandler));
+    inst->api.RemoveVectoredExceptionHandler = (RemoveVectoredExceptionHandler_t)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sRemoveVectoredExceptionHandler));
+    inst->api.ExitThread = (ExitThread_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitThread);
+    inst->api.ExitProcess = (ExitProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitProcess);
+    inst->api.FlushInstructionCache = (FlushInstructionCache_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sFlushInstructionCache);
+    inst->api.GetCurrentProcess = (GetCurrentProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCurrentProcess);
 	
     // For shellcode debug only
     // HMODULE msvcrt = inst->api.LoadLibraryA(inst->sMsvcrtDLL);
@@ -578,6 +679,11 @@ int Loader(INSTANCE* inst)
     printf("inst->api.VirtualProtect %p\n", inst->api.VirtualProtect);
     printf("inst->api.GetCommandLineA %p\n", inst->api.GetCommandLineA);
     printf("inst->api.RtlAddFunctionTable %p\n", inst->api.RtlAddFunctionTable);
+
+    printf("inst->api.Sleep %p\n", inst->api.Sleep);
+    printf("inst->api.AddVectoredExceptionHandler %p\n", inst->api.AddVectoredExceptionHandler);
+    printf("inst->api.RemoveVectoredExceptionHandler %p\n", inst->api.RemoveVectoredExceptionHandler);
+    printf("inst->api.FlushInstructionCache %p\n", inst->api.FlushInstructionCache);
 #endif
 
     // search for the start of the module
@@ -653,8 +759,10 @@ int Loader(INSTANCE* inst)
         // LoaderDotNetFunction _loaderDotNetFunction = (LoaderDotNetFunction)func;
         // _loaderDotNetFunction(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine);
 
+        // TODO handle the exit of the managed code in DotnetExe.cpp
         Spoof(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
-        
+
+        return 0;
     }
     //
     // Unmanaged code
@@ -708,8 +816,15 @@ int Loader(INSTANCE* inst)
             }
 #endif
 
+            // Handle exit of exe using VEH
+            InstallExitVEH(inst);
+
             // __debugbreak();
             Spoof(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
+
+            HandleExitBehavior();
+
+            return 0;
         }
         //
         // DLL
@@ -741,11 +856,15 @@ int Loader(INSTANCE* inst)
 #endif
 
             // __debugbreak();
+
+            // TODO Handle exit of the DLL by putting a VEH on the return of the DLL function ?
             Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
+            
+            return 0;
         }
     }
 
-	return 0;
+        return 0;
 }
 
 
@@ -1288,6 +1407,7 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
         return NULL;
 
     result->codeBase = code;
+    result->inst = inst;
     result->isDLL = (old_header->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
     result->pageSize = 0x1000;
 
@@ -1385,16 +1505,234 @@ static int _find(const void *a, const void *b)
 }
 
 
+#ifdef _M_X64
+#define IP Rip
+#else
+#define IP Eip
+#endif
+
+static BOOL PutInt3(INSTANCE* inst, LPBYTE target, BYTE* saved)
+{
+    if (!inst || !target || !saved)
+        return FALSE;
+
+    DWORD oldProtect = 0;
+    if (!MM_VirtualProtect(inst, target, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return FALSE;
+
+    *saved = *target;
+    *target = 0xCC;
+
+    HANDLE process = MM_GetCurrentProcess(inst);
+    if (process)
+        MM_FlushInstructionCache(inst, process, target, 1);
+
+    MM_VirtualProtect(inst, target, 1, oldProtect, &oldProtect);
+    return TRUE;
+}
+
+static void RestoreByte(INSTANCE* inst, LPBYTE target, BYTE saved)
+{
+    if (!inst || !target)
+        return;
+
+    DWORD oldProtect = 0;
+    if (!MM_VirtualProtect(inst, target, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return;
+
+    *target = saved;
+
+    HANDLE process = MM_GetCurrentProcess(inst);
+    if (process)
+        MM_FlushInstructionCache(inst, process, target, 1);
+
+    MM_VirtualProtect(inst, target, 1, oldProtect, &oldProtect);
+}
+
+static LONG CALLBACK VehExitTrap(PEXCEPTION_POINTERS p)
+{
+    if (!p || p->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    INSTANCE* inst = MmGetThreadInstance();
+    if (!inst)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
+    void* addr = p->ExceptionRecord->ExceptionAddress;
+    if (addr == ctx->k32ExitProcess || addr == ctx->ntdllExitUserProcess) {
+        p->ContextRecord->IP = (DWORD_PTR)AfterExeContinuation;
+
+#ifdef DEBUG_OUTPUT
+        printf("VehExitTrap\n");
+#endif
+
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+
+static BOOL InstallExitVEH(INSTANCE* inst)
+{
+#ifdef DEBUG_OUTPUT
+    printf("InstallExitVEH\n");
+#endif
+
+    if (!inst)
+        return FALSE;
+
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
+
+    if (ctx->vehHandle)
+        return TRUE;
+
+    if (!inst->api.VirtualProtect || !inst->api.AddVectoredExceptionHandler ||
+        !inst->api.RemoveVectoredExceptionHandler || !inst->api.ExitThread ||
+        !inst->api.ExitProcess || !inst->api.FlushInstructionCache ||
+        !inst->api.GetCurrentProcess)
+        return FALSE;
+
+    ctx->previousArbitraryUserPointer = MmReadArbitraryUserPointer();
+    ctx->hasPreviousArbitraryUserPointer = 1;
+    MmWriteArbitraryUserPointer(inst);
+
+    HMODULE k32 = MM_GetModuleHandleA(inst, (char*)inst->sKernel32DLL);
+    HMODULE ntd = MM_GetModuleHandleA(inst, (char*)inst->sNtDLL);
+    if (!k32 || !ntd)
+        goto Failure;
+
+    ctx->k32ExitProcess = (LPBYTE)MM_GetProcAddress(inst, k32, (char*)inst->sExitProcess);
+    ctx->ntdllExitUserProcess = (LPBYTE)MM_GetProcAddress(inst, ntd, (char*)inst->sRtlExitUserProcess);
+    if (!ctx->k32ExitProcess || !ctx->ntdllExitUserProcess)
+        goto Failure;
+
+    if (!PutInt3(inst, ctx->k32ExitProcess, &ctx->savedK32Byte))
+        goto Failure;
+    if (!PutInt3(inst, ctx->ntdllExitUserProcess, &ctx->savedNtdllByte))
+    {
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        goto Failure;
+    }
+
+    ctx->vehHandle = MM_AddVectoredExceptionHandler(inst, 1, VehExitTrap);
+
+    if (!ctx->vehHandle)
+    {
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        RestoreByte(inst, ctx->ntdllExitUserProcess, ctx->savedNtdllByte);
+        goto Failure;
+    }
+
+#ifdef DEBUG_OUTPUT
+    printf("InstallExitVEH OK\n");
+#endif
+    return TRUE;
+
+Failure:
+    if (ctx->hasPreviousArbitraryUserPointer)
+    {
+        MmWriteArbitraryUserPointer(ctx->previousArbitraryUserPointer);
+        ctx->previousArbitraryUserPointer = NULL;
+        ctx->hasPreviousArbitraryUserPointer = 0;
+    }
+    ctx->k32ExitProcess = NULL;
+    ctx->ntdllExitUserProcess = NULL;
+    ctx->vehHandle = NULL;
+    return FALSE;
+}
+
+static void RemoveExitVEH(INSTANCE* inst)
+{
+    if (!inst)
+        return;
+
+    EXIT_VEH_CONTEXT* ctx = &inst->exitVehContext;
+
+    if (ctx->vehHandle) {
+        MM_RemoveVectoredExceptionHandler(inst, ctx->vehHandle);
+        ctx->vehHandle = NULL;
+    }
+
+    if (ctx->k32ExitProcess) {
+        RestoreByte(inst, ctx->k32ExitProcess, ctx->savedK32Byte);
+        ctx->k32ExitProcess = NULL;
+    }
+
+    if (ctx->ntdllExitUserProcess) {
+        RestoreByte(inst, ctx->ntdllExitUserProcess, ctx->savedNtdllByte);
+        ctx->ntdllExitUserProcess = NULL;
+    }
+
+    if (ctx->hasPreviousArbitraryUserPointer) {
+        MmWriteArbitraryUserPointer(ctx->previousArbitraryUserPointer);
+        ctx->previousArbitraryUserPointer = NULL;
+        ctx->hasPreviousArbitraryUserPointer = 0;
+    }
+}
+
+static DWORD HandleExitBehavior(void)
+{
+#ifdef DEBUG_OUTPUT
+        printf("HandleExitBehavior\n");
+#endif
+
+    INSTANCE* inst = MmGetThreadInstance();
+    if (!inst)
+        return 0;
+
+    RemoveExitVEH(inst);
+
+#ifdef DEBUG_OUTPUT
+    printf("RemoveExitVEH\n");
+#endif
+
+    BYTE mode = inst->exitMode;
+    if (mode != 2 && mode != 3)
+        mode = 1;
+
+#ifdef DEBUG_OUTPUT
+    printf("mode %u\n", mode);
+#endif
+
+    if (mode == 3) {
+        for (;;) {
+            MM_Sleep(inst, 1000);
+        }
+    }
+
+    if (mode == 2) {
+        MM_ExitProcess(inst, 0);
+    } else {
+        MM_ExitThread(inst, 0);
+    }
+
+    return 0;
+}
+
+static DWORD WINAPI AfterExeContinuation(LPVOID parameter)
+{
+    (void)parameter;
+    return HandleExitBehavior();
+}
+
 static inline int MemoryCallEntryPoint(HMEMORYMODULE mod)
 {
     PMEMORYMODULE module = (PMEMORYMODULE)mod;
-	
-    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated) 
+
+    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated || !module->inst)
     {
         return -1;
     }
 
-    return module->exeEntry();
+    if (!InstallExitVEH(module->inst))
+        return -2;
+
+    module->exeEntry();
+
+    HandleExitBehavior();
+    return 0;
 }
 
 
@@ -1521,6 +1859,16 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
 	strncat((char*)inst->sGetCommandLineA, "GetCommandLineA", 15);
 	strncat((char*)inst->sGetCommandLineW, "GetCommandLineW", 15);
     strncat((char*)inst->sRtlAddFunctionTable, "RtlAddFunctionTable", 19);
+    strncat((char*)inst->sSleep, "Sleep", 5);
+    strncat((char*)inst->sAddVectoredExceptionHandler, "RtlAddVectoredExceptionHandler", 30);
+    strncat((char*)inst->sRemoveVectoredExceptionHandler, "RtlRemoveVectoredExceptionHandler", 33);
+    strncat((char*)inst->sExitThread, "ExitThread", 10);
+    strncat((char*)inst->sExitProcess, "ExitProcess", 11);
+    strncat((char*)inst->sFlushInstructionCache, "FlushInstructionCache", 21);
+    strncat((char*)inst->sGetCurrentProcess, "GetCurrentProcess", 17);
+    strncat((char*)inst->sRtlExitUserProcess, "RtlExitUserProcess", 18);
+
+    inst->exitMode = 3;
 
 	strncat((char*)inst->sKernel32DLL, "kernel32.dll", 12);
 	strncat((char*)inst->sKernelBaseDLL, "kernelbase.dll", 14);
@@ -1612,6 +1960,8 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
     printf("[+] Loader launch\n");
 
     Loader(inst);
+
+    printf("[+] Loader end\n");
     
 	return 0;
 }
