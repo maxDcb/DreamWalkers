@@ -1,3 +1,5 @@
+EXTERN AfterDllContinuation:PROC
+
 .code
 
 Spoof proc
@@ -6,6 +8,7 @@ Spoof proc
     ; We removed any backup of old context because we don't come back
     ; ---------------------------------------------------------------------
 
+    mov    r12, rsp                    ; Save original stack pointer
     pop    rax                         ; Real return address in rax
 
     mov    rdi, [rsp + 32]             ; Storing struct in the rdi
@@ -88,19 +91,22 @@ Spoof proc
     mov    [rsp], r11
 
     ; ----------------------------------------------------------------------
-    ; Gadget frame
-    ; ----------------------------------------------------------------------
-    
-    sub    rsp, [rdi + 48]
-    mov    r11, [rdi + 80]
-    mov    [rsp], r11
-
-    ; ----------------------------------------------------------------------
     ; We don't intend to come back to this code so we don't fix anything
     ; ----------------------------------------------------------------------
 
     mov    r11, rsi                    ; Copying function to call into r11
+
+    mov    [rdi + 8], r12              ; Real return address is now moved into the "OG_retaddr" member
+    mov    [rdi + 16], rbx             ; original rbx is stored into "rbx" member
+    lea    rbx, [SpoofDllReturn]                ; Fixup address is moved into rbx
+    mov    [rdi], rbx                  ; Fixup member now holds the address of Fixup
+    mov    rbx, rdi                    ; Address of param struct (Fixup) is moved into rbx
+
     jmp    r11
+
+SpoofDllReturn:
+    mov    rsp, r12                    ; Restore original stack pointer
+    jmp    AfterDllContinuation
 
 
 Spoof endp

