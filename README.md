@@ -89,12 +89,16 @@ The output `finalShellcode.bin` is a standalone, reflectively loadable shellcode
 
 ```powershell
 PS B:\framework\DreamWalkers> python .\GenerateShellcode.py
-usage: GenerateShellcode.py [-h] -f FILE [-m METHOD] [-c CMD]
+usage: GenerateShellcode.py [-h] -f FILE [-m METHOD] [-c CMD] [-x {1,2,3}]
 
-Options:
-  -f FILE       Path to EXE or DLL to embed
-  -m METHOD     Exported method to call (DLL only)
-  -c CMD        Command-line argument string
+Generate shellcode from any given PE.
+
+options:
+  -h, --help           show this help message and exit
+  -f, --file FILE      PE file path (DLL or EXE)
+  -m, --method METHOD  Method name to invoke in case of DLL
+  -c, --cmd CMD        Command line arguments
+  -x, --exit {1,2,3}   Exit behavior: 1=exit thread, 2=exit process, 3=block indefinitely
 ```
 
 Make sure to build the shellcode after any changes to the loader or input structure.
