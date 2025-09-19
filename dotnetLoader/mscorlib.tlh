@@ -16186,6 +16186,4 @@ ILease : IDispatch
         /*[out,retval]*/ enum LeaseState * pRetVal ) = 0;
 };
 
-} // namespace mscorlib
-
-#pragma pack(pop)
+} // namespac

