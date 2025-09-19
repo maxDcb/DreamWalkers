@@ -2,6 +2,7 @@ import struct
 import re
 import argparse
 import os
+from pathlib import Path
 
 
 def read_exe_to_buffer(exe_path):
@@ -199,7 +200,7 @@ def buildLoaderShellcode(fileName, methodeDll, args, exit_mode):
     # if the file is a .NET executable, we need to get the dotnetLoader and append the exe file after
     if isDotNet:
         isDotNet=1
-        dotnetLoader_path = "./bin/goodClr.dll"
+        headerdotnetLoader_path_file = os.path.join(Path(__file__).parent, 'bin/goodClr.dll')
         dotnetLoader = read_exe_to_buffer(dotnetLoader_path)
     else:
         isDotNet=0
@@ -234,7 +235,8 @@ def buildLoaderShellcode(fileName, methodeDll, args, exit_mode):
     #
     # Get the loader_size and instance_size
     #
-    header_file = "./bin/memorymodule_exe_x64.h"
+
+    header_file = os.path.join(Path(__file__).parent, 'bin/memorymodule_exe_x64.h')
     array_name = "MEMORYMODULE_EXE_X64"
 
     try:
