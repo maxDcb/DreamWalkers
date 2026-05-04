@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "DreamWalkers.py"
+      - "README.md"
+      - "build.ps1"
+      - "bin/memorymodule_exe_arm64.h"
+      - "bin/memorymodule_exe_x64.h"
+      - "bin/memorymodule_exe_x86.h"
+      - "ci/**"
+      - "dotnetLoader/**"
+      - "exe2h/**"
+      - "memoryModule/**"
+      - "shellcodeTester/**"
+      - "testDll/**"
+      - "testExe/**"
+      - "tests/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "DreamWalkers.py"
+      - "README.md"
+      - "build.ps1"
+      - "bin/memorymodule_exe_arm64.h"
+      - "bin/memorymodule_exe_x64.h"
+      - "bin/memorymodule_exe_x86.h"
+      - "ci/**"
+      - "dotnetLoader/**"
+      - "exe2h/**"
+      - "memoryModule/**"
+      - "shellcodeTester/**"
+      - "testDll/**"
+      - "testExe/**"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arch-smoke:
+    name: ${{ matrix.arch }}-${{ matrix.expected_status }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            expected_status: supported
+            runner: windows-latest
+          - arch: x86
+            expected_status: supported
+            runner: windows-latest
+          - arch: arm64
+            expected_status: supported
+            runner: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python
+        run: python -m py_compile DreamWalkers.py
+
+      - name: Run architecture contract tests
+        env:
+          DREAMWALKERS_TEST_ARCH: ${{ matrix.arch }}
+          DREAMWALKERS_EXPECTED_ARCH_STATUS: ${{ matrix.expected_status }}
+        run: python -m unittest tests.test_arch_contract -v
+
+      - name: Build CMake artifacts
+        shell: pwsh
+        run: |
+          .\build.ps1 -Arch ${{ matrix.arch }} -Target all -Config Release
+
+      - name: Build managed smoke payload
+        shell: pwsh
+        run: |
+          $outDir = ".\build\${{ matrix.arch }}\out\Release"
+          $payload = Join-Path $outDir "managed_payload.exe"
+          $cscCandidates = @(
+            "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+          )
+          $csc = $cscCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (!$csc) {
+            throw "Unable to find a .NET Framework C# compiler."
+          }
+
+          & $csc /nologo /target:exe /platform:anycpu /optimize+ /out:$payload .\ci\managed_payload.cs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path $payload)) { throw "managed_payload.exe was not generated" }
+
+      - name: Run managed smoke payload directly
+        shell: pwsh
+        run: |
+          $payload = ".\build\${{ matrix.arch }}\out\Release\managed_payload.exe"
+
+          $output = & $payload "ci-direct" 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          Write-Output "managed_payload direct exit code: $exitCode"
+
+          if ($exitCode -ne 0) { exit $exitCode }
+
+      - name: Run goodClr direct managed smoke test
+        shell: pwsh
+        run: |
+          $goodClrTest = ".\build\${{ matrix.arch }}\out\Release\GoodClrDirectTest.exe"
+          $goodClr = ".\build\${{ matrix.arch }}\out\Release\goodClr.dll"
+          $payload = ".\build\${{ matrix.arch }}\out\Release\managed_payload.exe"
+
+          $output = & $goodClrTest $goodClr $payload "ci-goodclr" 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          Write-Output "GoodClrDirectTest exit code: $exitCode"
+
+          if ($exitCode -ne 0) { exit $exitCode }
+
+          $joinedOutput = $output -join "`n"
+          if ($joinedOutput -notmatch "\[\+\] GoodClrDirectTest go returned 0") {
+            throw "GoodClrDirectTest did not return success."
+          }
+          if ($joinedOutput -notmatch "managed_payload_go") {
+            throw "GoodClrDirectTest did not execute the managed payload entry point."
+          }
+
+      - name: Run LoaderTest unmanaged MemoryModule DEBUG_OUTPUT smoke test
+        shell: pwsh
+        run: |
+          $loaderTest = ".\build\${{ matrix.arch }}\out\Release\LoaderTest.exe"
+          $payload = ".\build\${{ matrix.arch }}\out\Release\smoke_payload.dll"
+
+          $output = & $loaderTest $payload 1 go 0 "ci" 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          Write-Output "LoaderTest unmanaged exit code: $exitCode"
+
+          if ($exitCode -ne 0) { exit $exitCode }
+
+          $joinedOutput = $output -join "`n"
+          if ($joinedOutput -notmatch "\[ \] testGenric") {
+            throw "LoaderTest did not print DEBUG_OUTPUT testGenric logs."
+          }
+          if ($joinedOutput -notmatch "\[\+\] Loader launch") {
+            throw "LoaderTest did not reach the MemoryModule loader path."
+          }
+          if ($joinedOutput -notmatch "smoke_payload_go") {
+            throw "LoaderTest did not execute the smoke payload export."
+          }
+
+      - name: Run LoaderTest managed MemoryModule DEBUG_OUTPUT smoke test
+        shell: pwsh
+        run: |
+          $loaderTest = ".\build\${{ matrix.arch }}\out\Release\LoaderTest.exe"
+          $payload = ".\build\${{ matrix.arch }}\out\Release\managed_payload.exe"
+
+          $output = & $loaderTest $payload 0 go 1 "ci-managed" 2>&1
+          $exitCode = $LASTEXITCODE
+          $joinedOutput = $output -join "`n"
+
+          if ($exitCode -ne 0) {
+            $output | Write-Output
+            Write-Output "LoaderTest managed exit code: $exitCode"
+            exit $exitCode
+          }
+          if ($joinedOutput -notmatch "\[ \] testGenric") {
+            $output | Write-Output
+            throw "LoaderTest did not print DEBUG_OUTPUT testGenric logs."
+          }
+          if ($joinedOutput -notmatch "\[\+\] Loader launch") {
+            $output | Write-Output
+            throw "LoaderTest did not reach the MemoryModule loader path."
+          }
+          if ($joinedOutput -notmatch "managed_payload_go") {
+            $output | Write-Output
+            throw "LoaderTest did not execute the managed payload entry point."
+          }
+          if ($joinedOutput -notmatch "DotNet return - debug no-exit") {
+            $output | Write-Output
+            throw "LoaderTest did not return from the managed MemoryModule path."
+          }
+
+          $output | Write-Output
+          Write-Output "LoaderTest managed exit code: $exitCode"
+
+      - name: Generate shellcode
+        shell: pwsh
+        run: |
+          python .\DreamWalkers.py --file .\build\${{ matrix.arch }}\out\Release\smoke_payload.dll --method go --arch ${{ matrix.arch }} --exit 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path .\finalShellcode.bin)) { throw "finalShellcode.bin was not generated" }
+
+      - name: Run shellcodeTester smoke test
+        shell: pwsh
+        run: |
+          .\build\${{ matrix.arch }}\out\Release\shellcodeTester.exe .\finalShellcode.bin --no-pause --thread
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

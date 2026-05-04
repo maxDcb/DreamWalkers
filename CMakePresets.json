@@ -1,0 +1,75 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/x64",
+      "cacheVariables": {
+        "DW_ENABLE_DOTNET_ETW_PATCH": "ON",
+        "DW_ENABLE_DOTNET_AMSI_PATCH": "ON",
+        "DW_ENABLE_DOTNET_SYSCALLS": "ON",
+        "DW_ENABLE_DOTNET_HOST_MEMORY_MANAGER": "ON"
+      }
+    },
+    {
+      "name": "windows-x86",
+      "displayName": "Windows x86",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "Win32",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/x86",
+      "cacheVariables": {
+        "DW_ENABLE_DOTNET_ETW_PATCH": "ON",
+        "DW_ENABLE_DOTNET_AMSI_PATCH": "ON",
+        "DW_ENABLE_DOTNET_SYSCALLS": "ON",
+        "DW_ENABLE_DOTNET_HOST_MEMORY_MANAGER": "ON"
+      }
+    },
+    {
+      "name": "windows-arm64",
+      "displayName": "Windows ARM64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "ARM64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/arm64",
+      "cacheVariables": {
+        "DW_ENABLE_DOTNET_ETW_PATCH": "ON",
+        "DW_ENABLE_DOTNET_AMSI_PATCH": "ON",
+        "DW_ENABLE_DOTNET_SYSCALLS": "ON",
+        "DW_ENABLE_DOTNET_HOST_MEMORY_MANAGER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-windows-x64",
+      "configurePreset": "windows-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x86",
+      "configurePreset": "windows-x86",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-arm64",
+      "configurePreset": "windows-arm64",
+      "configuration": "Release"
+    }
+  ]
+}

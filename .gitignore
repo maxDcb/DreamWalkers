@@ -1,4 +1,16 @@
 .vscode
+__pycache__/
+*.pyc
+build/
+*.obj
+*.lib
+*.exp
 *.exe
+ci/out/
+bin/x64/
+bin/x86/
+bin/arm64/
+bin/goodClr.dll
 bin/implantDLL.dll
+bin/memorymodule_exe_*.h
 finalShellcode.bin

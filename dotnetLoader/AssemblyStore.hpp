@@ -11,84 +11,86 @@
 class TargetAssembly
 {
 public:
-	TargetAssembly(void)
-	{
-		m_assemblyStream = nullptr;
+    TargetAssembly(void)
+    {
+        m_assemblyStream = nullptr;
 
-		m_id = 5000;
-		m_assemblyInfo = (LPWSTR)malloc(4096);
-		m_identityBufferSize = 4096;
+        m_id = 5000;
+        m_assemblyInfo = (LPWSTR)malloc(4096);
+        m_identityBufferSize = 4096;
 
-	};
-	~TargetAssembly(void)
-	{
-		free(m_assemblyInfo);
-	};
+    };
+    ~TargetAssembly(void)
+    {
+        if (m_assemblyStream != nullptr)
+            m_assemblyStream->Release();
+        free(m_assemblyInfo);
+    };
 
-	int updateTargetAssembly(ICLRAssemblyIdentityManager* identityManager, const std::string& data);
-	
-	LPWSTR getAssemblyInfo()
-	{
-		return m_assemblyInfo;
-	};
+    int updateTargetAssembly(ICLRAssemblyIdentityManager* identityManager, const std::string& data);
 
-	int getId()
-	{
-		return m_id;
-	};
+    LPWSTR getAssemblyInfo()
+    {
+        return m_assemblyInfo;
+    };
 
-	char* getAssembly()
-	{
-		return (char*)m_assembly.data();
-	};
+    int getId()
+    {
+        return m_id;
+    };
 
-	int getAssemblySize()
-	{
-		return m_assembly.size();
-	};
-	
+    char* getAssembly()
+    {
+        return const_cast<char*>(m_assembly.data());
+    };
+
+    int getAssemblySize()
+    {
+        return m_assembly.size();
+    };
+
 private:
-	DWORD m_identityBufferSize;
-	LPWSTR m_assemblyInfo;
+    DWORD m_identityBufferSize;
+    LPWSTR m_assemblyInfo;
 
-	std::string m_assembly;
+    std::string m_assembly;
 
-	IStream* m_assemblyStream;
+    IStream* m_assemblyStream;
 
-	int m_id;
+    int m_id;
 };
 
 
 class MyAssemblyStore : public IHostAssemblyStore
 {
 public:
-	MyAssemblyStore(void);
-	~MyAssemblyStore(void);
+    MyAssemblyStore(void);
+    ~MyAssemblyStore(void);
 
     virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,void  **ppv);
     virtual ULONG   STDMETHODCALLTYPE AddRef(void);
     virtual ULONG   STDMETHODCALLTYPE Release(void);
 
-	virtual HRESULT STDMETHODCALLTYPE ProvideAssembly(AssemblyBindInfo* pBindInfo, UINT64* pAssemblyId, UINT64* pContext, IStream** ppStmAssemblyImage, IStream** ppStmPDB);
-	virtual HRESULT STDMETHODCALLTYPE ProvideModule(ModuleBindInfo* pBindInfo, DWORD* pdwModuleId, IStream** ppStmModuleImage, IStream** ppStmPDB);
-	
-	int setTargetAssembly(TargetAssembly * targetAssembly)
-	{
-		m_targetAssembly = targetAssembly;
-		return 0;
-	}
+    virtual HRESULT STDMETHODCALLTYPE ProvideAssembly(AssemblyBindInfo* pBindInfo, UINT64* pAssemblyId, UINT64* pContext, IStream** ppStmAssemblyImage, IStream** ppStmPDB);
+    virtual HRESULT STDMETHODCALLTYPE ProvideModule(ModuleBindInfo* pBindInfo, DWORD* pdwModuleId, IStream** ppStmModuleImage, IStream** ppStmPDB);
 
-	int updateTargetAssembly(ICLRAssemblyIdentityManager* identityManager, const std::string& data);
+    int setTargetAssembly(TargetAssembly * targetAssembly)
+    {
+        m_targetAssembly = targetAssembly;
+        return 0;
+    }
 
-	LPWSTR getAssemblyInfo()
-	{
-		return m_targetAssembly->getAssemblyInfo();
-	};
+    int updateTargetAssembly(ICLRAssemblyIdentityManager* identityManager, const std::string& data);
+
+    LPWSTR getAssemblyInfo()
+    {
+        return m_targetAssembly->getAssemblyInfo();
+    };
 
 protected:
-	DWORD count;
+    volatile LONG count;
 
 private:
-	TargetAssembly* m_targetAssembly;
+    TargetAssembly* m_targetAssembly;
 
 };

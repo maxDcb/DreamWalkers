@@ -1,15 +1,55 @@
 #include "helpers.h"
 #include "../common/PEstructs.h"
+#include <intrin.h>
+
+static int hlpStrCmp(const char* s1, const char* s2)
+{
+	while (*s1 && (*s1 == *s2))
+	{
+		s1++;
+		s2++;
+	}
+	return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
 
 
-HMODULE WINAPI hlpGetModuleHandle(LPCWSTR sModuleName) 
+static WCHAR hlpUpperW(WCHAR c)
+{
+	if (c >= L'a' && c <= L'z')
+		return c - (L'a' - L'A');
+
+	return c;
+}
+
+
+static int hlpWideStrCmpI(LPCWSTR s1, LPCWSTR s2)
+{
+	while (*s1 && *s2)
+	{
+		WCHAR c1 = hlpUpperW(*s1);
+		WCHAR c2 = hlpUpperW(*s2);
+
+		if (c1 != c2)
+			return (int)c1 - (int)c2;
+
+		s1++;
+		s2++;
+	}
+
+	return (int)hlpUpperW(*s1) - (int)hlpUpperW(*s2);
+}
+
+
+HMODULE WINAPI hlpGetModuleHandle(LPCWSTR sModuleName)
 {
 	// get the offset of Process Environment Block
-#ifdef _M_IX86 
-	PEB * ProcEnvBlk = (PEB *) __readfsdword(0x30);
-#else
-	PEB * ProcEnvBlk = (PEB *)__readgsqword(0x60);
-#endif
+	#ifdef _M_IX86
+		PEB * ProcEnvBlk = (PEB *) __readfsdword(0x30);
+	#elif defined(_M_ARM64)
+		PEB * ProcEnvBlk = *(PEB **)((BYTE *)NtCurrentTeb() + 0x60);
+	#else
+		PEB * ProcEnvBlk = (PEB *)__readgsqword(0x60);
+	#endif
 	PEB_LDR_DATA * Ldr = ProcEnvBlk->Ldr;
 		
 	// return base address of a calling module
@@ -19,14 +59,12 @@ HMODULE WINAPI hlpGetModuleHandle(LPCWSTR sModuleName)
 	LIST_ENTRY * ModuleList = &Ldr->InMemoryOrderModuleList;
 	LIST_ENTRY *  pStartListEntry = ModuleList->Flink;
 	LIST_ENTRY *  px;
-	for (px  = pStartListEntry;	px != ModuleList; px  = px->Flink)	
+	for (px  = pStartListEntry;	px != ModuleList; px  = px->Flink)
 	{
 		LDR_DATA_TABLE_ENTRY * pe = (LDR_DATA_TABLE_ENTRY *) ((BYTE *) px - sizeof(LIST_ENTRY));
 
-		const char * pbuff = (const char *) pe->BaseDllName.Buffer;
-		const char * pm = (const char *)sModuleName;
-		
-		if (strcmp(pbuff, pm) == 0)
+		LPCWSTR pbuff = pe->BaseDllName.Buffer;
+		if (pbuff && hlpWideStrCmpI(pbuff, sModuleName) == 0)
 			return (HMODULE) pe->DllBase;
 	}
 
@@ -80,7 +118,7 @@ FARPROC WINAPI hlpGetProcAddress(HMODULE hMod, char * sProcName)
 		{
 			char * sTmpFuncName = (char *) pBaseAddr + (DWORD_PTR) pFuncNameTbl[ii];
 	
-			if (strcmp(sProcName, sTmpFuncName) == 0)	
+			if (hlpStrCmp(sProcName, sTmpFuncName) == 0)
 			{
 				// found, get the function virtual address = RVA + BaseAddr
 				pProcAddr = (FARPROC) (pBaseAddr + (DWORD_PTR) pEAT[pHintsTbl[ii]]);

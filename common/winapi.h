@@ -34,6 +34,18 @@
 
 #include <windows.h>
 
+#if defined(_M_X64) || defined(_M_ARM64)
+#define DW_HAS_RUNTIME_FUNCTION_TABLE 1
+#else
+#define DW_HAS_RUNTIME_FUNCTION_TABLE 0
+#endif
+
+#if defined(_M_X64)
+#define DW_HAS_STACK_SPOOFING 1
+#else
+#define DW_HAS_STACK_SPOOFING 0
+#endif
+
 
 typedef LPVOID(WINAPI* HeapAlloc_t)(
     HANDLE hHeap,
@@ -219,10 +231,12 @@ typedef PVOID (WINAPI* AddVectoredExceptionHandler_t)(
 typedef ULONG (WINAPI* RemoveVectoredExceptionHandler_t)(
     PVOID                       Handle);
 
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
 typedef PRUNTIME_FUNCTION(WINAPI* RtlLookupFunctionEntry_t)(
     DWORD64               ControlPc,
     PDWORD64              ImageBase,
     PUNWIND_HISTORY_TABLE HistoryTable);
+#endif
 
 typedef BOOL(WINAPI* AllocConsole_t)(void);
 
@@ -549,15 +563,19 @@ typedef NTSTATUS(WINAPI* RtlDecompressBufferEx_t)(
     PULONG                 FinalUncompressedSize,
     PVOID                  WorkSpace);
 
+#if DW_HAS_STACK_SPOOFING
 typedef NTSTATUS(WINAPI* BaseThreadInitThunk_t)(
     DWORD64               ControlPc,
     PDWORD64              ImageBase,
     PUNWIND_HISTORY_TABLE HistoryTable);
+#endif
 
-typedef NTSTATUS(WINAPI* RtlAddFunctionTable_t)(
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+typedef BOOLEAN(WINAPI* RtlAddFunctionTable_t)(
   PRUNTIME_FUNCTION FunctionTable,
   DWORD             EntryCount,
   DWORD64           BaseAddress);
+#endif
 
 typedef NTSTATUS(WINAPI* RtlUserThreadStart_t)(
     LPTHREAD_START_ROUTINE lpStartAddress,
@@ -619,4 +637,3 @@ typedef ULONG (WINAPI *RemoveVectoredExceptionHandler_t)(
 */
 
 #endif
-

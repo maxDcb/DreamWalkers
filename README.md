@@ -42,12 +42,14 @@ Big thanks to [@almounah](https://github.com/almounah) for his early support (ev
 ```
 /DreamWalkers
 ├── bin/                   # Output folder for compiled binaries and shellcode
+├── build.ps1              # CMake wrapper for local and CI builds
+├── CMakeLists.txt         # MSVC/CMake build graph
+├── CMakePresets.json      # x64, x86 and ARM64 configure presets
 ├── common/                # Shared code or headers
-├── compile.bat            # Windows batch script to compile components
 ├── dotnetLoader/          # C++ CLR host loader for .NET payloads
 ├── exe2h/                 # Tool for extracting TEXT section of binaries
 ├── finalShellcode.bin     # Final compiled shellcode output
-├── GenerateShellcode.py   # Python script to generate shellcode and input structure
+├── DreamWalkers.py        # Python script to generate shellcode and input structure
 ├── memoryModule/          # Modified, position-independent MemoryModule loader
 ├── shellcodeTester/       # Shellcode testing utilities 
 ├── testDll/               # Sample DLL payloads for testing loader
@@ -59,17 +61,19 @@ Big thanks to [@almounah](https://github.com/almounah) for his early support (ev
 
 ## 🚀 How to Use
 
-The project includes a Python script, `GenerateShellcode.py`, that bundles your payload (EXE or DLL) together with the position-independent loader, builds the required structure, and outputs a standalone shellcode blob.
+The project includes a Python script, `DreamWalkers.py`, that bundles your payload (EXE or DLL) together with the position-independent loader, builds the required structure, and outputs a standalone shellcode blob.
 
 ### 📦 Basic Usage
 
 ```powershell
-PS B:\framework\DreamWalkers> python .\GenerateShellcode.py -f .\Rubeus.exe -c help
+PS B:\framework\DreamWalkers> python .\DreamWalkers.py -f .\Rubeus.exe -c help
 ````
 
 * `-f`: Path to the payload (EXE or DLL)
 * `-c`: Command-line arguments passed to the loaded module
 * `-m`: (Optional) Method name to call if the payload is a DLL
+* `-a`: Target architecture (`auto`, `x86`, `x64`, or `arm64`)
+* `--module-stomping`: Enable stomping `Windows.Storage.dll` instead of the default private allocation
 
 ### 🧠 Example Output
 
@@ -88,8 +92,8 @@ The output `finalShellcode.bin` is a standalone, reflectively loadable shellcode
 ### 📘 Help Menu
 
 ```powershell
-PS B:\framework\DreamWalkers> python .\GenerateShellcode.py
-usage: GenerateShellcode.py [-h] -f FILE [-m METHOD] [-c CMD] [-x {1,2,3}]
+PS B:\framework\DreamWalkers> python .\DreamWalkers.py
+usage: DreamWalkers.py [-h] -f FILE [-m METHOD] [-c CMD] [-a {auto,x86,x64,arm64}] [--module-stomping | --no-module-stomping] [-x {1,2,3}]
 
 Generate shellcode from any given PE.
 
@@ -98,6 +102,11 @@ options:
   -f, --file FILE      PE file path (DLL or EXE)
   -m, --method METHOD  Method name to invoke in case of DLL
   -c, --cmd CMD        Command line arguments
+  -a, --arch {auto,x86,x64,arm64}
+                        Target loader architecture
+  --module-stomping    Enable module stomping into Windows.Storage.dll
+  --no-module-stomping
+                        Use private allocation instead of module stomping (default)
   -x, --exit {1,2,3}   Exit behavior: 1=exit thread, 2=exit process, 3=block indefinitely
 ```
 
@@ -107,11 +116,48 @@ Make sure to build the shellcode after any changes to the loader or input struct
 
 ## 🚀 How to Build
 
-From "x64 Native Tools Command Prompt for VS 2022":
+From PowerShell with Visual Studio 2022 and CMake available:
 
+```powershell
+.\build.ps1 -Arch all -Target all -Config Release
 ```
-.\compile.bat 
+
+Build every configured architecture:
+
+```powershell
+.\build.ps1 -Arch all -Target all -Config Release
 ```
+
+Build only the CI smoke artifacts:
+
+```powershell
+.\build.ps1 -Arch x64 -Target ci-smoke -Config Release
+```
+
+Available targets are `all`, `ci-smoke`, `exe2h`, `memoryModule`, `memoryModuleAsm`, `dotnetLoader`, `shellcodeTester`, `testDll`, `testExe`, and `smoke-payload`.
+The native MemoryModule shellcode generation and `dotnetLoader`/`goodClr` builds are wired for x64, x86, and ARM64.
+
+### Architecture Notes
+
+The x64, x86 and ARM64 builds share the same MemoryModule and `goodClr` managed-loading path. Optional `goodClr` behavior is split into independent CMake flags so each feature can be validated in isolation:
+
+- `DW_ENABLE_DOTNET_ETW_PATCH`
+- `DW_ENABLE_DOTNET_AMSI_PATCH`
+- `DW_ENABLE_DOTNET_SYSCALLS`
+- `DW_ENABLE_DOTNET_HOST_MEMORY_MANAGER`
+- `DW_ENABLE_DOTNET_TRACE`
+
+The ETW patch, AMSI patch, syscall wrappers, and host memory manager are enabled by default in the CMake presets and in the baseline CMake configuration. `DW_ENABLE_DOTNET_TRACE` stays disabled by default and should only be enabled for diagnostic runs.
+
+Current ARM64 assumption: the managed MemoryModule path should stay stable with the normal `goodClr` compile options. The CI managed ARM64 test repeats this path to catch intermittent CLR startup or early managed invocation failures.
+
+Related architecture docs:
+
+- [memoryModuleLoader build notes](docs/memorymodule-loader-build-notes.md)
+- [Python/C `INSTANCE` layout contract](docs/instance-layout-contract.md)
+- [shellcode bootstrap](docs/shellcode-bootstrap.md)
+- [per-architecture feature matrix](docs/architecture-feature-matrix.md)
+- [ARM64 module stomping and unwind metadata](docs/arm64-module-stomping-unwind.md)
 
 ---
 
@@ -123,7 +169,3 @@ From "x64 Native Tools Command Prompt for VS 2022":
 - ChatGPT – For helping with stack unwinding research
 
 ---
-
-
-
-

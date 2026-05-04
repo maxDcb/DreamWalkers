@@ -1,171 +1,264 @@
 #include "MemoryManager.hpp"
 #include "HostMalloc.hpp"
 
-#include <iostream>
+#include <algorithm>
+#include <new>
 
 
 MyMemoryManager::MyMemoryManager(void)
 {
-	count = 0;
-	m_mallocManager = new MyHostMalloc();
+    count = 1;
+    InitializeCriticalSection(&m_allocListLock);
 }
 
 
 MyMemoryManager::~MyMemoryManager(void)
 {
-	delete m_mallocManager;
+    for (auto entry : m_memAllocList)
+        delete entry;
+    for (auto entry : m_mallocList)
+        delete entry;
+    DeleteCriticalSection(&m_allocListLock);
 }
 
 
-HRESULT STDMETHODCALLTYPE MyMemoryManager::QueryInterface(REFIID vTableGuid, void** ppv) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::QueryInterface(REFIID vTableGuid, void** ppv)
 {
-	if (!IsEqualIID(vTableGuid, IID_IUnknown) && !IsEqualIID(vTableGuid, IID_IHostMemoryManager)) 
-	{
-		*ppv = 0;
-		return E_NOINTERFACE;
-	}
-	*ppv = this;
-	this->AddRef();
-	return S_OK;
+    if (ppv == NULL)
+        return E_POINTER;
+
+    if (!IsEqualIID(vTableGuid, IID_IUnknown) && !IsEqualIID(vTableGuid, IID_IHostMemoryManager))
+    {
+        *ppv = 0;
+        return E_NOINTERFACE;
+    }
+    *ppv = this;
+    this->AddRef();
+    return S_OK;
 }
 
 
-ULONG STDMETHODCALLTYPE MyMemoryManager::AddRef() 
+ULONG STDMETHODCALLTYPE MyMemoryManager::AddRef()
 {
-	return(++((MyMemoryManager*)this)->count);
+    return static_cast<ULONG>(InterlockedIncrement(&count));
 }
 
 
-ULONG STDMETHODCALLTYPE MyMemoryManager::Release() 
+ULONG STDMETHODCALLTYPE MyMemoryManager::Release()
 {
-	if (--((MyMemoryManager*)this)->count == 0) 
-	{
-		GlobalFree(this);
-		return 0;
-	}
-	return ((MyMemoryManager*)this)->count;
+    ULONG refCount = static_cast<ULONG>(InterlockedDecrement(&count));
+    if (refCount == 0)
+    {
+        delete this;
+        return 0;
+    }
+    return refCount;
 }
 
 
 // This is called when the CLR wants to do heap allocations, it's responsible for returning our implementation of IHostMalloc
-HRESULT MyMemoryManager::CreateMalloc(DWORD dwMallocType, IHostMalloc** ppMalloc) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::CreateMalloc(DWORD dwMallocType, IHostMalloc** ppMalloc)
 {
-	// std::cout << "MyMemoryManager::CreateMalloc" << std::endl;
+    if (ppMalloc == NULL)
+        return E_POINTER;
+    *ppMalloc = NULL;
 
-	//C reate a heap and add it to our interface struct
-	HANDLE hHeap = NULL;
-	if (dwMallocType & MALLOC_EXECUTABLE) 
-	{
-		hHeap = ::HeapCreate(HEAP_CREATE_ENABLE_EXECUTE, 0, 0);
-	}
-	else 
-	{
-		hHeap = ::HeapCreate(0, 0, 0);
-	}
-	m_mallocManager->hHeap = hHeap;
+    HANDLE hHeap = NULL;
+    if (dwMallocType & MALLOC_EXECUTABLE)
+    {
+        hHeap = ::HeapCreate(HEAP_CREATE_ENABLE_EXECUTE, 0, 0);
+    }
+    else
+    {
+        hHeap = ::HeapCreate(0, 0, 0);
+    }
+    if (hHeap == NULL)
+        return HRESULT_FROM_WIN32(GetLastError());
 
-	*ppMalloc = m_mallocManager;
-	return S_OK;
+    MyHostMalloc* mallocManager = new (std::nothrow) MyHostMalloc(hHeap, this, &m_allocListLock, &m_mallocList);
+    if (mallocManager == NULL)
+    {
+        ::HeapDestroy(hHeap);
+        return E_OUTOFMEMORY;
+    }
+
+    *ppMalloc = mallocManager;
+    return S_OK;
 }
 
 
 //The Virtual* API calls are responsible for non-heap memory management, you can just call the Virtual* APIs as intended or implement your own routines
-HRESULT MyMemoryManager::VirtualAlloc(void* pAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect, EMemoryCriticalLevel eCriticalLevel, void** ppMem) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::VirtualAlloc(void* pAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect, EMemoryCriticalLevel eCriticalLevel, void** ppMem)
 {
+    (void)eCriticalLevel;
 
-	LPVOID allocAddress = ::VirtualAlloc(pAddress, dwSize, flAllocationType, flProtect);
+    if (ppMem == NULL)
+        return E_POINTER;
+    *ppMem = NULL;
 
-	// std::cout << "MyMemoryManager::VirtualAlloc " << std::hex << allocAddress << std::endl;
+    LPVOID allocAddress = ::VirtualAlloc(pAddress, dwSize, flAllocationType, flProtect);
 
-	*ppMem = allocAddress;
+    if (allocAddress == NULL)
+        return HRESULT_FROM_WIN32(GetLastError());
 
-	MemAllocEntry* allocEntry = new MemAllocEntry();
-	allocEntry->Address = allocAddress;
-	allocEntry->size = dwSize;
-	allocEntry->type = MEM_ALLOC_VIRTUALALLOC;
-	m_memAllocList.push_back(allocEntry);
+    MemAllocEntry* allocEntry = new (std::nothrow) MemAllocEntry();
+    if (allocEntry == NULL)
+    {
+        ::VirtualFree(allocAddress, 0, MEM_RELEASE);
+        return E_OUTOFMEMORY;
+    }
+    allocEntry->Address = allocAddress;
+    allocEntry->size = dwSize;
+    allocEntry->type = MEM_ALLOC_VIRTUALALLOC;
 
-	return S_OK;
+    EnterCriticalSection(&m_allocListLock);
+    try
+    {
+        m_memAllocList.push_back(allocEntry);
+    }
+    catch (...)
+    {
+        LeaveCriticalSection(&m_allocListLock);
+        delete allocEntry;
+        ::VirtualFree(allocAddress, 0, MEM_RELEASE);
+        return E_OUTOFMEMORY;
+    }
+    LeaveCriticalSection(&m_allocListLock);
+
+    *ppMem = allocAddress;
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
-	// std::cout << "MyMemoryManager::VirtualFree" << std::endl;
+    if (lpAddress == NULL)
+        return S_OK;
 
-	::VirtualFree(lpAddress, dwSize, dwFreeType);
-	lpAddress = nullptr;
+    EnterCriticalSection(&m_allocListLock);
+    auto it = std::find_if(m_memAllocList.begin(), m_memAllocList.end(), [lpAddress](const MemAllocEntry* entry) {
+        return entry != NULL && entry->Address == lpAddress && entry->type == MEM_ALLOC_VIRTUALALLOC;
+    });
+    if (!::VirtualFree(lpAddress, dwSize, dwFreeType))
+    {
+        DWORD lastError = GetLastError();
+        LeaveCriticalSection(&m_allocListLock);
+        return HRESULT_FROM_WIN32(lastError == ERROR_SUCCESS ? ERROR_INVALID_PARAMETER : lastError);
+    }
 
-	return S_OK;
+    if (it != m_memAllocList.end())
+    {
+        MemAllocEntry* allocEntry = *it;
+        m_memAllocList.erase(it);
+        delete allocEntry;
+    }
+    LeaveCriticalSection(&m_allocListLock);
+
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::VirtualQuery(void* lpAddress, void* lpBuffer, SIZE_T dwLength, SIZE_T* pResult) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::VirtualQuery(void* lpAddress, void* lpBuffer, SIZE_T dwLength, SIZE_T* pResult)
 {
-	// std::cout << "MyMemoryManager::VirtualQuery" << std::endl;
+    if (lpBuffer == NULL || pResult == NULL)
+        return E_POINTER;
 
-	*pResult = ::VirtualQuery(lpAddress, (PMEMORY_BASIC_INFORMATION)lpBuffer, dwLength);
-	return S_OK;
+    *pResult = ::VirtualQuery(lpAddress, (PMEMORY_BASIC_INFORMATION)lpBuffer, dwLength);
+    if (*pResult == 0)
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::VirtualProtect(void* lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* pflOldProtect) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::VirtualProtect(void* lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* pflOldProtect)
 {
-	// std::cout << "MyMemoryManager::VirtualProtect" << std::endl;
+    if (pflOldProtect == NULL)
+        return E_POINTER;
 
-	::VirtualProtect(lpAddress, dwSize, flNewProtect, pflOldProtect);
+    if (!::VirtualProtect(lpAddress, dwSize, flNewProtect, pflOldProtect))
+        return HRESULT_FROM_WIN32(GetLastError());
 
-	return S_OK;
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::GetMemoryLoad(DWORD* pMemoryLoad, SIZE_T* pAvailableBytes) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::GetMemoryLoad(DWORD* pMemoryLoad, SIZE_T* pAvailableBytes)
 {
-	// std::cout << "MyMemoryManager::GetMemoryLoad" << std::endl;
+    if (pMemoryLoad == NULL || pAvailableBytes == NULL)
+        return E_POINTER;
 
-	//Just returning arbitrary values
-	*pMemoryLoad = 30;
-	*pAvailableBytes = 100 * 1024 * 1024;
-	return S_OK;
+    MEMORYSTATUSEX memoryStatus = {};
+    memoryStatus.dwLength = sizeof(memoryStatus);
+    if (!::GlobalMemoryStatusEx(&memoryStatus))
+        return HRESULT_FROM_WIN32(GetLastError());
+
+    *pMemoryLoad = memoryStatus.dwMemoryLoad;
+    *pAvailableBytes = static_cast<SIZE_T>(memoryStatus.ullAvailVirtual);
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::RegisterMemoryNotificationCallback(ICLRMemoryNotificationCallback* pCallback) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::RegisterMemoryNotificationCallback(ICLRMemoryNotificationCallback* pCallback)
 {
-	// std::cout << "MyMemoryManager::RegisterMemoryNotificationCallback" << std::endl;
-	return S_OK;
+    (void)pCallback;
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::NeedsVirtualAddressSpace(LPVOID startAddress, SIZE_T size) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::NeedsVirtualAddressSpace(LPVOID startAddress, SIZE_T size)
 {
-	// std::cout << "MyMemoryManager::NeedsVirtualAddressSpace" << std::endl;
-	return S_OK;
+    (void)startAddress;
+    (void)size;
+    return S_OK;
 }
 
 
 //
 // This is a notification callback that will be triggered whenever a .NET assembly is loaded into the process
 //
-HRESULT MyMemoryManager::AcquiredVirtualAddressSpace(LPVOID startAddress, SIZE_T size) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::AcquiredVirtualAddressSpace(LPVOID startAddress, SIZE_T size)
 {
-	// std::cout << "MyMemoryManager::AcquiredVirtualAddressSpace" << std::endl;
-	// std::cout << "Mapped file with size " << size <<  " bytes into memory at  " << std::hex << startAddress << std::endl;
+    //This is used to track the assemblies that are mapped into the process
+    MemAllocEntry* allocEntry = new (std::nothrow) MemAllocEntry();
+    if (allocEntry == NULL)
+        return E_OUTOFMEMORY;
 
-	//This is used to track the assemblies that are mapped into the process
-	MemAllocEntry* allocEntry = new MemAllocEntry();
-	allocEntry->Address = startAddress;
-	allocEntry->size = size;
-	allocEntry->type = MEM_ALLOC_MAPPED_FILE;
-	m_memAllocList.push_back(allocEntry);
-	
+    allocEntry->Address = startAddress;
+    allocEntry->size = size;
+    allocEntry->type = MEM_ALLOC_MAPPED_FILE;
 
-	return S_OK;
+    EnterCriticalSection(&m_allocListLock);
+    try
+    {
+        m_memAllocList.push_back(allocEntry);
+    }
+    catch (...)
+    {
+        LeaveCriticalSection(&m_allocListLock);
+        delete allocEntry;
+        return E_OUTOFMEMORY;
+    }
+    LeaveCriticalSection(&m_allocListLock);
+
+    return S_OK;
 }
 
 
-HRESULT MyMemoryManager::ReleasedVirtualAddressSpace(LPVOID startAddress) 
+HRESULT STDMETHODCALLTYPE MyMemoryManager::ReleasedVirtualAddressSpace(LPVOID startAddress)
 {
-	// std::cout << "MyMemoryManager::ReleasedVirtualAddressSpace" << std::endl;
-	return S_OK;
+    MemAllocEntry* allocEntry = NULL;
+    EnterCriticalSection(&m_allocListLock);
+    auto it = std::find_if(m_memAllocList.begin(), m_memAllocList.end(), [startAddress](const MemAllocEntry* entry) {
+        return entry != NULL && entry->Address == startAddress && entry->type == MEM_ALLOC_MAPPED_FILE;
+    });
+    if (it != m_memAllocList.end())
+    {
+        allocEntry = *it;
+        m_memAllocList.erase(it);
+    }
+    LeaveCriticalSection(&m_allocListLock);
+
+    delete allocEntry;
+    return S_OK;
 }

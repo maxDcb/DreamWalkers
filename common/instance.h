@@ -42,31 +42,23 @@ typedef struct _INSTANCE
     uint8_t sNtDLL[32];
     uint16_t wsKernel32DLL[32];
     uint8_t sKernelBaseDLL[32];      // cmdline
-    uint8_t sMsvcrtDLL[32];          // printf
 
     uint8_t sGetProcAddress[32];
     uint8_t sGetModuleHandleA[32];
     uint8_t sLoadLibraryA[32];
-    uint8_t sFreeLibrary[32];
     uint8_t sVirtualAlloc[32];
     uint8_t sVirtualFree[32];
     uint8_t sVirtualProtect[32];
-    uint8_t sHeapAlloc[32];
-    uint8_t sHeapFree[32];
-    uint8_t sGetProcessHeap[32];
-    uint8_t sGetLastError[32];
     uint8_t sGetNativeSystemInfo[32];
-    uint8_t sIsBadReadPtr[32];
-    uint8_t sHeapReAlloc[32];
-    uint8_t sWaitForSingleObject[32];
-    uint8_t sCreateThread[32];
+#if DW_HAS_STACK_SPOOFING
     uint8_t sRtlLookupFunctionEntry[32]; // stack spoofing
     uint8_t sBaseThreadInitThunk[32];    // stack spoofing
     uint8_t sRtlUserThreadStart[32];     // stack spoofing
-    uint8_t sPrintf[32];                 // printf
+#endif
     uint8_t sGetCommandLineA[32];        // cmdline
-    uint8_t sGetCommandLineW[32];        // cmdline
-    uint8_t sRtlAddFunctionTable[32];    // stack spoofing
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+    uint8_t sRtlAddFunctionTable[32];    // runtime unwind table
+#endif
     uint8_t sSleep[32];
     uint8_t sAddVectoredExceptionHandler[32];
     uint8_t sRemoveVectoredExceptionHandler[64];
@@ -79,28 +71,21 @@ typedef struct _INSTANCE
     struct
     {
         LoadLibraryA_t                LoadLibraryA;
-        FreeLibrary_t                 FreeLibrary;
         GetProcAddress_t              GetProcAddress;
         GetModuleHandleA_t            GetModuleHandleA;
         VirtualAlloc_t                VirtualAlloc;
         VirtualFree_t                 VirtualFree;
         VirtualProtect_t              VirtualProtect;
-        WaitForSingleObject_t         WaitForSingleObject;
-        CreateThread_t                CreateThread;
         GetCommandLineA_t             GetCommandLineA;     // cmdline
-        GetCommandLineW_t             GetCommandLineW;     // cmdline
-        HeapAlloc_t                   HeapAlloc;
-        HeapReAlloc_t                 HeapReAlloc;
-        GetProcessHeap_t              GetProcessHeap;
-        HeapFree_t                    HeapFree;
-        GetLastError_t                GetLastError;
         GetNativeSystemInfo_t         GetNativeSystemInfo;
-        IsBadReadPtr_t                IsBadReadPtr;
+#if DW_HAS_STACK_SPOOFING
         RtlLookupFunctionEntry_t      RtlLookupFunctionEntry; // stack spoofing
         BaseThreadInitThunk_t         BaseThreadInitThunk;    // stack spoofing
         RtlUserThreadStart_t          RtlUserThreadStart;     // stack spoofing
-        printf_t                      Printf;                 // printf
-        RtlAddFunctionTable_t         RtlAddFunctionTable;    // stack spoofing
+#endif
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+        RtlAddFunctionTable_t         RtlAddFunctionTable;    // runtime unwind table
+#endif
         Sleep_t                       Sleep;
         AddVectoredExceptionHandler_t AddVectoredExceptionHandler;
         RemoveVectoredExceptionHandler_t RemoveVectoredExceptionHandler;
@@ -127,8 +112,12 @@ typedef struct _INSTANCE
 
     EXIT_VEH_CONTEXT exitVehContext;
 
-    uint8_t sPDataSec[8];           // stack spoofing
+#if DW_HAS_RUNTIME_FUNCTION_TABLE
+    uint8_t sPDataSec[8];           // runtime unwind table
+#endif
+#if DW_HAS_STACK_SPOOFING
     uint8_t sGadget[8];             // stack spoofing
+#endif
 
     uint8_t isDll;
     uint8_t sdllMethode[256];
@@ -136,8 +125,6 @@ typedef struct _INSTANCE
     uint8_t isDotNet;
     uint32_t dotnetLoaderSize;
     uint32_t dotnetModuleSize;
-
-    uint8_t sDebug[32];             // debug string
 
     void* ptrModuleTst;             // LoaderTest
     void* ptrDotNetModuleTst;       // LoaderTest
